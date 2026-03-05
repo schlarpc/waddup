@@ -191,6 +191,83 @@ Adding a new hash algorithm to waddup requires:
 3. Distributing the new image_id in a client update
 4. No new trusted setup ceremony (the Groth16 circuit is universal)
 
+### Proof Composition Alternative
+
+RISC Zero's proof composition feature (env::verify inside a guest) could reduce per-algorithm
+proving cost by pivoting through SHA-256 as a shared binding hash, rather than requiring
+every guest to compute BLAKE3 directly:
+
+```
+waddup-sha256:       SHA256(F) + BLAKE3(F)   → commits (H_sha256, H_blake3) to journal
+waddup-sha1-comp:    SHA1(F) + SHA256(F)     → commits (H_sha1, H_sha256) to journal
+waddup-sha512-comp:  SHA512(F) + SHA256(F)   → commits (H_sha512, H_sha256) to journal
+composer:            env::verify both receipts, check H_sha256 matches
+                     → outputs (H_content, H_blake3)
+```
+
+The key insight is that two composed proofs cannot directly assert they operated on the same
+private input (the file F). However, if both sub-guests compute a shared pivot hash over F,
+the composer can check equality of the pivot values across journals. Since SHA-256 is
+collision-resistant, matching pivot values guarantees the same file (up to SHA-256 collision
+resistance). This binds the content hash to BLAKE3 transitively without the non-primary
+guest ever computing BLAKE3.
+
+#### Why This Matters: SHA-1/MD5-Only Sources
+
+Many real-world hash sources (legacy package repositories, older distribution mirrors) only
+publish SHA-1 or MD5 checksums. Binding these weak hashes to BLAKE3 is the critical path —
+not a secondary concern. The seeder has the file and can compute any hash natively, but
+proving inside the zkVM is where cost matters.
+
+SHA-256 is the only hash function with a built-in zkVM precompile that is both relevant and
+efficient. The zkVM also has a Keccak (SHA-3) precompile, but benchmarks show it is 13x
+slower per byte than SHA-256 (15.6 vs 1.2 cycles/byte) and has disproportionate prover
+overhead — see Performance Considerations for measured results. No other hash relevant to
+waddup (SHA-1, SHA-512, MD5, BLAKE3) has any precompile.
+
+SHA-256 as the pivot hash is an internal implementation detail, not exposed in the protocol.
+Keccak was considered as an alternative pivot for construction diversity (sponge vs
+Merkle-Damgård), but the 13x per-byte cost penalty provides no practical benefit for an
+implementation detail that only needs collision resistance.
+
+This makes SHA-256 the natural pivot hash for composition:
+
+| Guest                  | Hashes computed in zkVM           | Expensive?                         |
+|------------------------|-----------------------------------|------------------------------------|
+| Monolithic `waddup-sha1` | SHA1 (software) + BLAKE3 (software) | Yes — BLAKE3 dominates (~10-100x more cycles than accelerated SHA-256) |
+| Composed `waddup-sha1-comp` | SHA1 (software) + SHA256 (precompile) | Much cheaper — avoids BLAKE3 entirely |
+| Base `waddup-sha256`   | SHA256 (precompile) + BLAKE3 (software) | Yes, but generated once per file and reused for all algorithms |
+
+The composition approach means the expensive BLAKE3 proving cost is paid exactly once per
+file (in the `waddup-sha256` guest), regardless of how many content-hash algorithms need to
+bind to that file's BLAKE3 swarm identifier. Every additional algorithm only needs to prove
+its own hash + the cheap SHA-256 pivot, then compose.
+
+#### Benefits
+
+- The `waddup-sha256` receipt (SHA256 + BLAKE3) is generated once per file and reused as a
+  pivot for all other algorithms. Only one guest ever pays the BLAKE3-in-zkVM cost.
+- Non-primary algorithm guests (SHA-1, SHA-512, MD5, etc.) compute only their own hash +
+  SHA-256. The SHA-256 precompile makes the pivot hash nearly free relative to any
+  software-only hash computation.
+- Adding a new content-hash algorithm never requires implementing BLAKE3 in the new guest.
+- For SHA-1/MD5-only sources (a primary use case), this dramatically reduces proving cost
+  compared to the monolithic approach.
+
+#### Tradeoffs
+
+- Adds a composition/resolve step to the proving pipeline for non-SHA-256 algorithms.
+- The `waddup-sha256` proof must exist before other algorithms can compose against it (or
+  both must be generated and composed together).
+- More complex verification: the leecher must accept composed proofs with multiple image_ids.
+- If a BLAKE3 application-defined precompile is built (see Performance Considerations),
+  the cost advantage largely disappears — BLAKE3 becomes cheap in every guest, and the
+  monolithic approach is simpler.
+
+Given that many target sources only publish weak hashes, and BLAKE3 has no zkVM precompile,
+composition via SHA-256 pivot is likely the right default architecture for non-SHA-256
+algorithms rather than an optimization to revisit later.
+
 ---
 
 ## Participant Flows
@@ -370,62 +447,131 @@ RISC Zero's ceremony (April-May 2024):
 
 ### Performance Considerations
 
-RISC Zero provides a hardware-accelerated SHA-256 precompile in the zkVM (68 cycles per
-64-byte block, ~1.06 cycles/byte). BLAKE3 does not have a built-in precompile, but as of
-zkVM 1.2, RISC Zero supports **application-defined precompiles** — custom accelerators that
-ship with the application, not the zkVM itself. This is the path for BLAKE3 acceleration.
+#### Measured Precompile Performance (10 KiB input, CPU prover)
+
+Benchmarks on a 10 KiB input using optimized I/O and sequential runs:
+
+| Metric         | SHA-256 only      | SHA3-256 only       | SHA-256 + BLAKE3              |
+|----------------|-------------------|---------------------|-------------------------------|
+| Hash cycles    | 12,263 (1.2 c/B)  | 159,893 (15.6 c/B)  | 12,264 + 271,788 (1.2 + 26.5 c/B) |
+| Startup + read | 22,396            | 22,231              | 22,236                        |
+| User cycles    | 38,897            | 188,863             | 310,810                       |
+| Total cycles   | 131,072           | 262,144             | 524,288                       |
+| Segments       | 1                 | 1                   | 1                             |
+| Proving time   | 15.9s             | 86.9s               | 60.9s                         |
+| Verification   | 14ms              | 27ms                | 15ms                          |
+
+Key observations:
+- **SHA-256 precompile** is extremely efficient: 1.2 cycles/byte.
+- **SHA3-256 (Keccak) precompile** is 13x slower than SHA-256 at 15.6 cycles/byte, despite
+  also being a built-in precompile. Proving time is disproportionately high (86.9s for 262K
+  total cycles vs 60.9s for 524K total cycles with SHA-256+BLAKE3), suggesting the Keccak
+  precompile generates additional circuit proof segments not reflected in the rv32im cycle
+  count but still requiring proving work.
+- **BLAKE3 (no precompile)** is 22x slower than SHA-256 at 26.5 cycles/byte and dominates
+  the combined SHA-256+BLAKE3 guest's cycle count (271K of 284K hash cycles).
+
+These numbers confirm SHA-256 as the right pivot hash for proof composition (see Proof
+Composition Alternative in Hash Agility). SHA3-256/Keccak was considered as an alternative
+pivot for construction diversity (sponge vs Merkle-Damgård), but at 13x the per-byte cost
+and disproportionate prover overhead, it offers no practical advantage. The pivot hash is an
+internal implementation detail not exposed in the protocol.
+
+#### CPU vs GPU Proving Throughput
+
+Our CPU proving times are roughly 1.2-1.6x slower per rv32im cycle than RISC Zero's
+published benchmark CPU, which is reasonable for different hardware.
+
+GPU speedup ratios from RISC Zero benchmarks (Linux CPU vs NVIDIA RTX A5000, 8 KiB input):
+
+| Workload  | CPU (benchmark) | GPU A5000 | Speedup |
+|-----------|-----------------|-----------|---------|
+| SHA-256   | 38.5s           | 5.7s      | 6.7x   |
+| Keccak    | 118.2s          | 51.6s     | 2.3x   |
+| BLAKE3    | 21.5s           | 5.2s      | 4.1x   |
+
+Applying these ratios to our measured CPU times for 10 KiB:
+
+| Mode (10 KiB)    | Our CPU (Linux) | Est. CUDA A5000 | Est. Metal M2 Pro   |
+|-------------------|-----------------|-----------------|---------------------|
+| SHA-256 only      | 15.9s           | ~2.4s           | ~35s (worse than CPU) |
+| SHA3-256 only     | 86.9s           | ~38-43s         | ~90-120s            |
+| SHA-256 + BLAKE3  | 60.9s           | ~15s            | ~100-150s           |
+
+The Keccak case benefits least from GPU acceleration because the keccak circuit proving
+(not the rv32im circuit) is the bottleneck, and it does not parallelize on GPU as well.
+This further reinforces SHA-256 over Keccak as the composition pivot hash — the Keccak
+penalty is even worse on GPU than on CPU.
 
 #### Application-Defined BLAKE3 Precompile
 
-zkVM 1.2 introduced the ability for applications to define their own precompiles. These are
-custom circuits that execute specific computations natively rather than as interpreted
-RISC-V guest code. Reference results from early adopters show dramatic improvements —
-Automata Network reduced their guest program from 39M to 217K cycles (~180x reduction)
-using an application-defined precompile.
+RISC Zero (as of zkVM 1.2) supports **application-defined precompiles** — custom accelerators
+that ship with the application, not the zkVM itself. Reference results from early adopters
+show dramatic improvements — Automata Network reduced their guest program from 39M to 217K
+cycles (~180x reduction) using an application-defined precompile.
 
 A BLAKE3 precompile for waddup would:
-- Replace the interpreted BLAKE3 guest code with a dedicated circuit
+- Replace the interpreted BLAKE3 guest code (26.5 cycles/byte) with a dedicated circuit
 - Potentially bring BLAKE3 cycle counts to the same order of magnitude as the built-in
-  SHA-256 accelerator (~68 cycles per 64-byte block)
+  SHA-256 accelerator (1.2 cycles/byte)
 - Eliminate BLAKE3 as the proving bottleneck, making SHA-256 and BLAKE3 roughly equal
   contributors to total proving time
 
 BLAKE3's structure is relatively circuit-friendly: simple compression function (based on
 ChaCha), binary Merkle tree, no complex scheduling. This is more tractable than something
-like Keccak (which RISC Zero is also working on as a built-in precompile).
+like Keccak (which has a built-in precompile but still shows high prover overhead).
 
 Writing the precompile is real cryptographic engineering work — it requires a circuit that
 proves BLAKE3 was computed correctly, not just code that computes BLAKE3. But this is a
 bounded, well-defined problem with a fixed specification to implement against.
 
-#### Proving Time Estimates
+#### Proving Time Extrapolation
 
-Without a BLAKE3 precompile, BLAKE3 runs as regular RISC-V guest code (potentially 10-100x
-more cycles per byte than accelerated SHA-256), and dominates proving time:
+Based on the measured 10 KiB per-byte rates, estimated hash cycle counts at larger file
+sizes (without a BLAKE3 precompile):
 
-| File size | SHA-256 cycles (accelerated) | BLAKE3 cycles (no precompile) | BLAKE3 cycles (est. w/ precompile) |
-|-----------|------------------------------|-------------------------------|-------------------------------------|
-| 1 KB      | ~1,100                       | ~50K-100K                     | ~1,100 (similar to SHA-256)         |
-| 1 MB      | ~17K                         | ~50-100M                      | ~17K                                |
-| 100 MB    | ~1.7M                        | ~5-10B                        | ~1.7M                               |
-| 1 GB      | ~17M                         | ~50-100B                      | ~17M                                |
+| File size | SHA-256 cycles (1.2 c/B) | BLAKE3 cycles (26.5 c/B) | Combined   |
+|-----------|--------------------------|--------------------------|------------|
+| 10 KiB    | 12K                      | 272K                     | 284K       |
+| 1 MB      | 1.3M                     | 27M                      | 28M        |
+| 100 MB    | 126M                     | 2.7B                     | 2.8B       |
+| 1 GB      | 1.3B                     | 27B                      | 28B        |
 
-With a BLAKE3 precompile, total cycle counts would be roughly 2x the SHA-256-only count
-(running both hashes at comparable speeds). Without one, BLAKE3 dominates by orders of
-magnitude.
+BLAKE3 accounts for ~96% of hash cycles. With a BLAKE3 precompile bringing it to parity
+with SHA-256 (~1.2 c/B), total hash cycles would drop by ~22x.
 
 #### Prover Backends
 
 RISC Zero does **not require a GPU**. The prover supports multiple backends:
 
-| Backend  | Hardware             | Relative Speed | Notes                          |
-|----------|----------------------|----------------|--------------------------------|
-| CPU      | Any x86/ARM          | 1x (baseline)  | Default, works everywhere      |
-| Metal    | Apple GPU (macOS)    | ~5-10x         | Via `RISC0_PROVER=metal`       |
-| CUDA     | NVIDIA GPU           | ~10-50x        | Via `RISC0_PROVER=cuda`        |
+| Backend  | Hardware             | Speedup vs CPU                    | Notes                          |
+|----------|----------------------|-----------------------------------|--------------------------------|
+| CPU      | Any x86/ARM          | 1x (baseline)                     | Default, works everywhere      |
+| Metal    | Apple GPU (macOS)    | **0.4-0.7x (slower than CPU)**    | Via `RISC0_PROVER=metal`       |
+| CUDA     | NVIDIA GPU           | 2.3-6.7x (measured, RTX A5000)    | Via `RISC0_PROVER=cuda`        |
+
+**Metal is slower than CPU.** RISC Zero benchmarks (Oct 2025, M2 Pro) show Metal
+consistently underperforms the same machine's CPU across all hash workloads:
+
+| Workload (8 KiB) | macOS CPU | Metal M2 Pro | CUDA A5000 |
+|-------------------|-----------|--------------|------------|
+| SHA-256           | 34.7s     | 85.7s (0.4x) | 5.7s (6.7x) |
+| BLAKE3            | 62.4s     | 120.5s (0.5x)| ~5.2s (4.1x)|
+| Keccak            | 133.1s    | 181.3s (0.7x)| 51.6s (2.3x)|
+
+Metal also generates more cycles for the same computation (e.g., big_blake3-8192: Metal
+produces 1,310,720 total cycles / 1,145,836 user cycles vs CPU's 1,048,576 / 656,306).
+The M2 Pro's GPU is likely not well-suited to the NTT/polynomial operations the prover
+requires. Metal exists as a backend but CPU is strictly better on the same hardware.
+
+**CUDA is the only backend that provides real acceleration.** Speedup is
+workload-dependent: 6.7x for SHA-256-dominated workloads (rv32im circuit parallelizes
+well), 4.1x for BLAKE3-dominated workloads, and only 2.3x for Keccak (precompile circuit
+is the bottleneck, parallelizes poorly on GPU). For the SHA-256+BLAKE3 base proof, an RTX
+A5000 would reduce 10 KiB proving from ~61s to ~15s.
 
 CPU proving is viable for small files or infrequent proving. For a seeder proving a handful
-of files, CPU may be acceptable. For a mirror seeding thousands of packages, GPU hardware
+of files, CPU may be acceptable. For a mirror seeding thousands of packages, CUDA hardware
 makes a significant difference. With a BLAKE3 precompile reducing cycle counts, CPU proving
 becomes more practical for larger files.
 
