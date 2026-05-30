@@ -1,13 +1,15 @@
-//! waddup chunk prover: processes one 64 KiB chunk.
+//! waddup chunk prover (variable size, 1..=64 BLAKE3 leaves per invocation).
 //!
-//! Reads `(chunk_index: u32, sha_state_in: [u32; 8], chunk: [u8; 65536])`.
-//! Produces `(chunk_index, sha_state_in, sha_state_out, leaf_cvs: [[u32; 8]; 64])`.
+//! Reads `(chunk_index: u32, num_leaves: u32, sha_state_in: [u32; 8], chunk: Vec<u8>)`
+//! where chunk.len() == num_leaves * 1024.
+//!
+//! Commits (variable length):
+//!   chunk_index || num_leaves || sha_state_in || sha_state_out || leaf_cvs[num_leaves]
 //!
 //! - SHA-256 state is updated block-by-block via SP1 precompiles. No padding here.
-//! - BLAKE3 leaves are computed independently for each of 64 sub-chunks; no tree
-//!   merging here (root handles that).
+//! - BLAKE3 leaves are independent; tree merging happens in the root.
 //!
-//! No heap allocations. Fixed-size stack buffers only. Panic = abort.
+//! No heap allocations in the hot path. Panic = abort.
 #![no_main]
 
 sp1_zkvm::entrypoint!(main);
@@ -16,16 +18,12 @@ use sp1_lib::{
     syscall_blake3_compress_inner, syscall_sha256_compress, syscall_sha256_extend,
 };
 
-const CHUNK_SIZE: usize = 65536;
+const MAX_LEAVES_PER_CHUNK: usize = 64;
 const BLAKE3_CHUNK_LEN: usize = 1024;
 const BLAKE3_BLOCK_LEN: usize = 64;
-const LEAVES_PER_CHUNK: usize = CHUNK_SIZE / BLAKE3_CHUNK_LEN; // 64
 const SHA_BLOCK_LEN: usize = 64;
+const MAX_CHUNK_BYTES: usize = MAX_LEAVES_PER_CHUNK * BLAKE3_CHUNK_LEN;
 
-const SHA256_IV: [u32; 8] = [
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c,
-    0x1f83d9ab, 0x5be0cd19,
-];
 const BLAKE3_IV: [u32; 8] = [
     0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C,
     0x1F83D9AB, 0x5BE0CD19,
@@ -36,7 +34,6 @@ const CHUNK_END: u32 = 1 << 1;
 #[inline]
 fn sha256_update_block(state: &mut [u64; 8], block: &[u8; SHA_BLOCK_LEN]) {
     let mut w: [u64; 64] = [0; 64];
-    // First 16 words are big-endian u32 from the block.
     for j in 0..16 {
         w[j] = u32::from_be_bytes([
             block[j * 4],
@@ -51,7 +48,6 @@ fn sha256_update_block(state: &mut [u64; 8], block: &[u8; SHA_BLOCK_LEN]) {
     }
 }
 
-/// BLAKE3 compress with the SP1 precompile + the final XOR.
 #[inline]
 fn blake3_compress(state: &mut [u32; 16], msg: &[u32; 16], cv_in: &[u32; 8]) {
     let mut state_u64: [u64; 16] = [0; 16];
@@ -115,16 +111,20 @@ fn blake3_leaf_cv(chunk: &[u8; BLAKE3_CHUNK_LEN], counter: u64) -> [u32; 8] {
 
 pub fn main() {
     let chunk_index: u32 = sp1_zkvm::io::read();
+    let num_leaves: u32 = sp1_zkvm::io::read();
     let sha_state_in: [u32; 8] = sp1_zkvm::io::read();
-    // 64 KiB chunk read into a fixed-size buffer.
     let chunk_vec = sp1_zkvm::io::read_vec();
 
-    // Copy into stack array. (read_vec gives us a Vec; we move into a stack buf.)
-    let mut chunk = [0u8; CHUNK_SIZE];
-    chunk.copy_from_slice(&chunk_vec[..CHUNK_SIZE]);
+    assert!(num_leaves >= 1 && (num_leaves as usize) <= MAX_LEAVES_PER_CHUNK);
+    let n = num_leaves as usize;
+    assert_eq!(chunk_vec.len(), n * BLAKE3_CHUNK_LEN);
+
+    // Copy into a fixed-max-size stack buffer (only the first n*1024 bytes used).
+    let mut chunk = [0u8; MAX_CHUNK_BYTES];
+    chunk[..n * BLAKE3_CHUNK_LEN].copy_from_slice(&chunk_vec[..]);
     drop(chunk_vec);
 
-    let chunk_start_counter: u64 = (chunk_index as u64) * (LEAVES_PER_CHUNK as u64);
+    let chunk_start_counter: u64 = (chunk_index as u64) * (MAX_LEAVES_PER_CHUNK as u64);
 
     let mut sha_state: [u64; 8] = [0; 8];
     for i in 0..8 {
@@ -132,7 +132,8 @@ pub fn main() {
     }
 
     println!("cycle-tracker-report-start:sha256_chunk");
-    for block_idx in 0..(CHUNK_SIZE / SHA_BLOCK_LEN) {
+    let n_sha_blocks = n * (BLAKE3_CHUNK_LEN / SHA_BLOCK_LEN);
+    for block_idx in 0..n_sha_blocks {
         let mut block = [0u8; SHA_BLOCK_LEN];
         block.copy_from_slice(
             &chunk[block_idx * SHA_BLOCK_LEN..(block_idx + 1) * SHA_BLOCK_LEN],
@@ -147,8 +148,8 @@ pub fn main() {
     }
 
     println!("cycle-tracker-report-start:blake3_leaves");
-    let mut leaf_cvs = [[0u32; 8]; LEAVES_PER_CHUNK];
-    for i in 0..LEAVES_PER_CHUNK {
+    let mut leaf_cvs = [[0u32; 8]; MAX_LEAVES_PER_CHUNK];
+    for i in 0..n {
         let mut leaf_chunk = [0u8; BLAKE3_CHUNK_LEN];
         leaf_chunk.copy_from_slice(
             &chunk[i * BLAKE3_CHUNK_LEN..(i + 1) * BLAKE3_CHUNK_LEN],
@@ -157,17 +158,17 @@ pub fn main() {
     }
     println!("cycle-tracker-report-end:blake3_leaves");
 
-    // Commit public values in a fixed order. All fixed-size so root can parse
-    // by offset.
+    // Commit public values (variable length depending on n).
     sp1_zkvm::io::commit_slice(&chunk_index.to_le_bytes());
+    sp1_zkvm::io::commit_slice(&num_leaves.to_le_bytes());
     for w in &sha_state_in {
         sp1_zkvm::io::commit_slice(&w.to_le_bytes());
     }
     for w in &sha_state_out {
         sp1_zkvm::io::commit_slice(&w.to_le_bytes());
     }
-    for cv in &leaf_cvs {
-        for w in cv {
+    for i in 0..n {
+        for w in &leaf_cvs[i] {
             sp1_zkvm::io::commit_slice(&w.to_le_bytes());
         }
     }

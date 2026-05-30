@@ -737,3 +737,108 @@ Wall-clock summary:
   root prove:   385.947903104s
   root verify:  37.767563ms
   grand total:  2300.22900734s
+=== RISC Zero | mode=both | size=1m | 2026-05-30T22:07:04Z ===
+warning: Git tree '/home/schlarpc/waddup' has uncommitted changes
+   Compiling methods v0.1.0 (/home/schlarpc/waddup/methods)
+   Compiling host v0.1.0 (/home/schlarpc/waddup/host)
+    Finished `release` profile [optimized] target(s) in 59.53s
+     Running `target/release/host --both 1m`
+waddup ZK Proof-of-Concept Benchmark
+=====================================
+Prover: CPU (local)
+Mode:   SHA-256 (accelerated) + BLAKE3 (software)
+
+--- SHA-256 (accelerated) + BLAKE3 (software) | 1 MiB (1048576 bytes) ---
+  SHA-256 (journal):   fbbab289f7f94b25736c58be46a994c441fd02552cc6022352e3d86d2fab7c83
+  SHA-256 (native):    fbbab289f7f94b25736c58be46a994c441fd02552cc6022352e3d86d2fab7c83
+  SHA-256 match:       OK
+  BLAKE3  (journal):   64479cf7293960210547db8d982359e0c4ce054525ed7086cf93030828fc0533
+  BLAKE3  (native):    64479cf7293960210547db8d982359e0c4ce054525ed7086cf93030828fc0533
+  BLAKE3  match:       OK
+  Guest cycle breakdown:
+    startup+read:      2395427 cycles
+    sha256:            1143602 cycles (1.1 cycles/byte)
+    blake3:            27992503 cycles (26.7 cycles/byte)
+  Proving time:        3590.735067289s
+  Verification time:   576.839142ms
+  Total segments:      36
+  Total cycles:        36831232
+  User cycles:         31535756
+
+=== Decomposed | size=10k | 2026-05-30T23:08:12Z ===
+warning: Git tree '/home/schlarpc/waddup' has uncommitted changes
+waddup decomposed bench
+  file size:        10240 bytes
+  total BLAKE3 leaves: 10
+  num chunk proofs: 1
+  leaves per chunk: [10]
+  expected SHA-256: e96760a87768717bcebcfd25ddc7d46b4dbc95a4b0014def080c08539f7d90d0
+  expected BLAKE3:  398d42d5677b8bc40eb177ea45565bea3fc2fec2927c80304424c244435f9a78
+
+Setup phase:
+  ProverClient init: 23.936711661s
+  setup chunk pk:    2.022997091s
+  setup root pk:     2.025449385s
+
+Chunk proving phase (1 chunks):
+  chunk   1/  1 ( 10 leaves): 94.469225436s
+  total: 94.469225436s, avg per chunk: 94.469225436s
+
+Root proving phase:
+  root prove: 114.469163024s
+
+Results:
+  H_content (journal): e96760a87768717bcebcfd25ddc7d46b4dbc95a4b0014def080c08539f7d90d0
+  H_content (native):  e96760a87768717bcebcfd25ddc7d46b4dbc95a4b0014def080c08539f7d90d0
+  H_content match:     OK
+  H_swarm   (journal): 398d42d5677b8bc40eb177ea45565bea3fc2fec2927c80304424c244435f9a78
+  H_swarm   (native):  398d42d5677b8bc40eb177ea45565bea3fc2fec2927c80304424c244435f9a78
+  H_swarm   match:     OK
+  root verify: 37.228257ms
+
+Wall-clock summary:
+  setup:        27.985158137s
+  chunk total:  94.469225436s
+  chunk avg:    94.469225436s
+  root prove:   114.469163024s
+  root verify:  37.228257ms
+  grand total:  236.960774854s
+=== Decomposed | size=100k | 2026-05-30T23:12:23Z ===
+warning: Git tree '/home/schlarpc/waddup' has uncommitted changes
+waddup decomposed bench
+  file size:        102400 bytes
+  total BLAKE3 leaves: 100
+  num chunk proofs: 2
+  leaves per chunk: [64, 36]
+  expected SHA-256: 27783e87963a4efb6829b531c9ba57b44f45797f6770bd637fbf0d807cbdbae0
+  expected BLAKE3:  9f05d49a48b2b787c8f7197ef8d5605978cae6eb8a445b46426b155e0accce44
+
+Setup phase:
+  ProverClient init: 23.787111165s
+  setup chunk pk:    2.016536016s
+  setup root pk:     2.007238156s
+
+Chunk proving phase (2 chunks):
+  chunk   1/  2 ( 64 leaves): 115.716878313s
+  chunk   2/  2 ( 36 leaves): 105.909860555s
+  total: 221.626738868s, avg per chunk: 110.813369434s
+
+Root proving phase:
+  root prove: 146.183980112s
+
+Results:
+  H_content (journal): 27783e87963a4efb6829b531c9ba57b44f45797f6770bd637fbf0d807cbdbae0
+  H_content (native):  27783e87963a4efb6829b531c9ba57b44f45797f6770bd637fbf0d807cbdbae0
+  H_content match:     OK
+  H_swarm   (journal): 9f05d49a48b2b787c8f7197ef8d5605978cae6eb8a445b46426b155e0accce44
+  H_swarm   (native):  9f05d49a48b2b787c8f7197ef8d5605978cae6eb8a445b46426b155e0accce44
+  H_swarm   match:     OK
+  root verify: 38.599631ms
+
+Wall-clock summary:
+  setup:        27.810885337s
+  chunk total:  221.626738868s
+  chunk avg:    110.813369434s
+  root prove:   146.183980112s
+  root verify:  38.599631ms
+  grand total:  395.660203948s

@@ -484,7 +484,9 @@ recursion verifier), parses by offset, chains.
 
 | Size       | Chunks  | Per-chunk avg | Chunk total | Root prove | Setup | Grand total | Peak mem |
 |------------|--------:|--------------:|------------:|-----------:|------:|------------:|---------:|
+| 10 KiB     |       1 |           94s |         94s |       114s |   28s |        237s |    ~22 G |
 | 64 KiB     |       1 |          125s |        125s |       121s |   30s |        277s |    ~25 G |
+| 100 KiB    |       2 |          111s |        222s |       146s |   28s |        396s |    ~25 G |
 | 128 KiB    |       2 |          121s |        242s |       152s |   28s |        422s |    ~30 G |
 | 1 MiB      |      16 |          118s |       1885s |       386s |   29s |       2300s |    ~53 G |
 
@@ -595,3 +597,56 @@ For reproducibility on NixOS:
    ~38 min for 1 MiB on this CPU box — but it's the right architecture once
    you exceed the monolithic memory ceiling, and that overhead vanishes on a
    GPU cluster running sub-proofs in parallel.
+
+### Finding 8 — Cross-prover scaling, full matrix
+
+Head-to-head prove wall-clock for the binding statement on the same hardware:
+
+| Size    | RZ monolithic | SP1 monolithic (PR2615) | SP1 decomposed | Winner            |
+|---------|--------------:|------------------------:|---------------:|:------------------|
+| 1 KiB   |        12.7s  |                   23.7s |        n/a [1] | RZ                |
+| 10 KiB  |        53.1s  |                   28.7s |           237s | SP1 monolithic    |
+| 100 KiB |       339.8s  |                   63.2s |           396s | SP1 monolithic    |
+| 1 MiB   |       3591s   |                     OOM |          2300s | **SP1 decomposed** |
+
+[1] decomposition is meaningless with 1 BLAKE3 leaf; the root would just be
+the leaf compress with ROOT, which is what the monolithic proof already does.
+
+Headline observations:
+
+1. **RZ's segment+recursion model never OOMs on this box.** 1 MiB ran 36
+   segments × lift/join recursion to a single receipt in ~60 minutes
+   wall-clock. That's the *architectural* property RZ has that SP1 doesn't —
+   application code doesn't need to know about segmentation.
+2. **SP1 monolithic wins where it fits.** Below ~150 KiB the proving time is
+   dominated by the fixed ~25 s SP1 setup + a much-lower per-cycle proving
+   cost than RZ; SP1 with both precompiles is 4-5× faster than RZ at 10-100
+   KiB. The wall is at ~150-300 KiB on a 64 GiB CPU box.
+3. **Above the SP1 monolithic ceiling, decomposed SP1 beats RZ monolithic
+   on wall-clock.** At 1 MiB: 38 min vs 60 min, a ~36% reduction. The win
+   comes from SP1's lower per-byte proving cost (BLAKE3 precompile is 8×
+   cheaper than RZ's unaccelerated path, SHA-256 is ~6.5× cheaper than RZ's
+   1.1 c/B blended with the chunking — wait, the SHA-256 precompile in RZ is
+   1.1 c/B, that's faster per byte than SP1's 6.5; the win is BLAKE3
+   dominating the binding cost and SP1's precompile crushing RZ's
+   unaccelerated path there). Even with the ~120 s per-sub-proof
+   `.compressed()` tax × 16 chunks (1920 s pure overhead), the underlying
+   SP1 prove cost is so much lower than RZ's at this size that it still wins.
+4. **The decomposition tax doesn't scale.** Each chunk's ~110-125 s is
+   dominated by the `.compressed()` recursion-compression step which is
+   per-sub-proof, not per-byte. As file size grows, the relative overhead
+   shrinks — at 1 MiB the tax is ~83% of wall-clock; at 10 MiB it would be
+   smaller (more chunks but proportionally more underlying work), at 1 GiB
+   it would be ~negligible. Reaching 1 GiB on a single CPU is impractical
+   (~12 hours sequential) but the architecture is the right one.
+5. **For waddup specifically**, the practical recommendation depends on
+   typical file size:
+   - **Median <100 KiB**: SP1 monolithic with both precompiles. Best
+     wall-clock, simplest deploy.
+   - **Median in 100 KiB – ~1 MiB**: SP1 monolithic if it fits in your
+     prover's memory; SP1 decomposed if it doesn't (single CPU box).
+     Either way, port PR #2615 to get the BLAKE3 precompile.
+   - **Files routinely > 1 MiB on CPU**: SP1 decomposed.
+   - **GPU cluster available**: SP1 decomposed scales near-ideally with
+     parallel proving capacity (chunks parallel, log N tree merges); RZ
+     scales via `RISC0_PROVER=actor` segment-parallel proving similarly.

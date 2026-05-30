@@ -8,10 +8,10 @@ use std::time::{Duration, Instant};
 const CHUNK_ELF: Elf = include_elf!("waddup-chunk-prover");
 const ROOT_ELF: Elf = include_elf!("waddup-root-prover");
 
-const PROOF_CHUNK_SIZE: usize = 65536; // 64 KiB per chunk_prover invocation.
 const BLAKE3_CHUNK_LEN: usize = 1024;
+const MAX_LEAVES_PER_CHUNK: usize = 64;
 
-fn sha256_state_at_boundaries(file: &[u8], num_chunks: usize) -> Vec<[u32; 8]> {
+fn sha256_state_at_boundaries(file: &[u8], leaves_per_chunk: &[usize]) -> Vec<[u32; 8]> {
     use sha2::{
         compress256,
         digest::generic_array::{typenum::U64, GenericArray},
@@ -20,14 +20,13 @@ fn sha256_state_at_boundaries(file: &[u8], num_chunks: usize) -> Vec<[u32; 8]> {
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c,
         0x1f83d9ab, 0x5be0cd19,
     ];
-    let mut boundaries = Vec::with_capacity(num_chunks + 1);
+    let mut boundaries = Vec::with_capacity(leaves_per_chunk.len() + 1);
     boundaries.push(state);
-    for ci in 0..num_chunks {
-        let start = ci * PROOF_CHUNK_SIZE;
-        let end = ((ci + 1) * PROOF_CHUNK_SIZE).min(file.len());
-        let chunk = &file[start..end];
-        debug_assert!(chunk.len() % 64 == 0, "chunk must be block-aligned");
-        let blocks_per_chunk = chunk.len() / 64;
+    let mut offset = 0usize;
+    for &n in leaves_per_chunk {
+        let nbytes = n * BLAKE3_CHUNK_LEN;
+        let chunk = &file[offset..offset + nbytes];
+        let blocks_per_chunk = nbytes / 64;
         let mut blocks: Vec<GenericArray<u8, U64>> = Vec::with_capacity(blocks_per_chunk);
         for bi in 0..blocks_per_chunk {
             let mut block = [0u8; 64];
@@ -36,8 +35,21 @@ fn sha256_state_at_boundaries(file: &[u8], num_chunks: usize) -> Vec<[u32; 8]> {
         }
         compress256(&mut state, &blocks);
         boundaries.push(state);
+        offset += nbytes;
     }
     boundaries
+}
+
+/// Split N total BLAKE3 leaves into chunks of size up to MAX_LEAVES_PER_CHUNK.
+fn chunk_layout(total_leaves: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut left = total_leaves;
+    while left > 0 {
+        let n = left.min(MAX_LEAVES_PER_CHUNK);
+        out.push(n);
+        left -= n;
+    }
+    out
 }
 
 fn main() {
@@ -57,28 +69,28 @@ fn main() {
         }
     };
     assert!(
-        size % PROOF_CHUNK_SIZE == 0,
-        "size {} must be a multiple of {} for this POC",
+        size % BLAKE3_CHUNK_LEN == 0,
+        "size {} must be a multiple of {} (BLAKE3 leaf size)",
         size,
-        PROOF_CHUNK_SIZE
+        BLAKE3_CHUNK_LEN
+    );
+    let total_leaves = size / BLAKE3_CHUNK_LEN;
+    assert!(
+        total_leaves >= 2,
+        "decomposition not useful below 2 leaves (file < 2 KiB)"
     );
 
-    let num_chunks = size / PROOF_CHUNK_SIZE;
+    let leaves_per_chunk = chunk_layout(total_leaves);
+    let num_chunks = leaves_per_chunk.len();
 
-    // File contents (deterministic pseudo-random matching the existing benches).
     let file: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
 
     println!("waddup decomposed bench");
-    println!("  file size:        {} bytes ({} MiB)", size, size / 1024 / 1024);
-    println!("  proof chunk size: {} bytes", PROOF_CHUNK_SIZE);
+    println!("  file size:        {} bytes", size);
+    println!("  total BLAKE3 leaves: {}", total_leaves);
     println!("  num chunk proofs: {}", num_chunks);
-    println!(
-        "  blake3 leaves:    {} ({} per chunk)",
-        num_chunks * PROOF_CHUNK_SIZE / BLAKE3_CHUNK_LEN,
-        PROOF_CHUNK_SIZE / BLAKE3_CHUNK_LEN,
-    );
+    println!("  leaves per chunk: {:?}", leaves_per_chunk);
 
-    // Native expected hashes (so we can validate the receipt).
     let expected_sha256: [u8; 32] = {
         use sha2::{Digest, Sha256};
         Sha256::digest(&file).into()
@@ -88,9 +100,6 @@ fn main() {
     println!("  expected BLAKE3:  {}", hex::encode(expected_blake3));
     println!();
 
-    // One ProverClient for the whole run — this is where session-level cache
-    // (lookup tables, basefold prep, gnark FFI init) gets amortized across
-    // all the prove() calls below.
     let setup_total = Instant::now();
     let client = ProverClient::from_env();
     let client_init = setup_total.elapsed();
@@ -112,19 +121,21 @@ fn main() {
     println!("  setup root pk:     {:?}", pk_root_elapsed);
     println!();
 
-    // Precompute SHA-256 boundary states natively.
-    let boundaries = sha256_state_at_boundaries(&file, num_chunks);
+    let boundaries = sha256_state_at_boundaries(&file, &leaves_per_chunk);
     assert_eq!(boundaries.len(), num_chunks + 1);
 
-    // Prove each chunk. Use .compressed() so the root can verify_sp1_proof them.
     let mut chunk_proofs: Vec<SP1ProofWithPublicValues> = Vec::with_capacity(num_chunks);
     let mut per_chunk_times: Vec<Duration> = Vec::with_capacity(num_chunks);
     println!("Chunk proving phase ({} chunks):", num_chunks);
-    for ci in 0..num_chunks {
-        let chunk_bytes: Vec<u8> =
-            file[ci * PROOF_CHUNK_SIZE..(ci + 1) * PROOF_CHUNK_SIZE].to_vec();
+    let mut byte_offset = 0usize;
+    for (ci, &n_leaves) in leaves_per_chunk.iter().enumerate() {
+        let nbytes = n_leaves * BLAKE3_CHUNK_LEN;
+        let chunk_bytes: Vec<u8> = file[byte_offset..byte_offset + nbytes].to_vec();
+        byte_offset += nbytes;
+
         let mut stdin = SP1Stdin::new();
         stdin.write(&(ci as u32));
+        stdin.write(&(n_leaves as u32));
         stdin.write(&boundaries[ci]);
         stdin.write_vec(chunk_bytes);
 
@@ -136,7 +147,13 @@ fn main() {
             .expect("chunk prove failed");
         let elapsed = t.elapsed();
         per_chunk_times.push(elapsed);
-        println!("  chunk {:3}/{:3}: {:?}", ci + 1, num_chunks, elapsed);
+        println!(
+            "  chunk {:3}/{:3} ({:3} leaves): {:?}",
+            ci + 1,
+            num_chunks,
+            n_leaves,
+            elapsed
+        );
         chunk_proofs.push(proof);
     }
     let chunk_phase_total: Duration = per_chunk_times.iter().sum();
@@ -144,15 +161,14 @@ fn main() {
     println!("  total: {:?}, avg per chunk: {:?}", chunk_phase_total, chunk_phase_avg);
     println!();
 
-    // Build root stdin.
     let mut root_stdin = SP1Stdin::new();
     root_stdin.write(&vk_chunk_hash);
     root_stdin.write(&(file.len() as u64));
+    root_stdin.write(&(total_leaves as u64));
     root_stdin.write(&(num_chunks as u32));
     for proof in &chunk_proofs {
         root_stdin.write_vec(proof.public_values.to_vec());
     }
-    // Add each compressed chunk proof for SP1 to witness inside verify_sp1_proof.
     for proof in &chunk_proofs {
         let SP1Proof::Compressed(inner) = proof.proof.clone() else {
             panic!("expected compressed proof");
@@ -162,8 +178,6 @@ fn main() {
 
     println!("Root proving phase:");
     let t = Instant::now();
-    // Root must be compressed because verify_sp1_proof is wired into the
-    // recursion verifier; core-mode root proofs can't witness the sub-proofs.
     let root_proof = client
         .prove(&pk_root, root_stdin)
         .compressed()
