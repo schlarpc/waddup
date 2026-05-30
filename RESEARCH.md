@@ -575,9 +575,12 @@ For reproducibility on NixOS:
    cycle counts. We ported SP1 PR #2615 forward and measured an 8.3x BLAKE3
    cycle reduction. Wall-clock proving improvement is more modest (13% at
    100 KiB) because SP1's fixed proving overhead dominates. The cycle
-   reduction would matter more at proof-batching or larger sizes. RISC Zero
-   has the same option via app-defined precompiles. **In neither case is the
-   chip safe to deploy without an audit.**
+   reduction would matter more at proof-batching or larger sizes. **In SP1
+   the chip is something an application can ship; in RZ a BLAKE3 precompile
+   would require a first-party zkVM-circuit change** — RZ's app-defined
+   precompile mechanism is scoped to modular/algebraic arithmetic (BigInt2,
+   demonstrated for RSA/ECC, not hashes; see Finding 8 caveats). In neither
+   case is the BLAKE3 chip safe to deploy without an audit.
 4. **The SP1 ecosystem has rough edges on v6.x.** The official precompile
    patches don't dispatch; without fixing this you get pure-software hashes
    and ~10x worse cycle counts. Worth filing upstream and worth doing the
@@ -650,3 +653,95 @@ Headline observations:
    - **GPU cluster available**: SP1 decomposed scales near-ideally with
      parallel proving capacity (chunks parallel, log N tree merges); RZ
      scales via `RISC0_PROVER=actor` segment-parallel proving similarly.
+
+#### Caveats — read the table with these in mind
+
+The numbers in the matrix are honest single-run wall clocks of two provers
+running the same proof statement on the same hardware, but several
+asymmetries make the comparison less clean than the bare numbers suggest:
+
+1. **Precompile coverage isn't symmetric.** RZ ran with SHA-256 accelerated
+   and **BLAKE3 unaccelerated** (~26.7 c/B); SP1 ran with both accelerated
+   (BLAKE3 at ~3.14 c/B via the PR2615 port). At 1 MiB the BLAKE3 region is
+   ~28 M cycles for RZ vs ~3.3 M for SP1, which is most of where SP1's
+   wall-clock advantage at 1 MiB comes from. We did *not* test "RZ + BLAKE3
+   precompile" because RZ has no comparable ship-it-in-your-app mechanism
+   for BLAKE3:
+   - **SP1's BLAKE3 precompile (PR #2615)** is a zkVM-chip change in SP1's
+     hand-written Plonky3 AIR — application-shippable in the sense that we
+     could port it forward in ~half a day of conflict resolution.
+   - **RZ's app-defined precompile mechanism (zkVM 1.2+)** is the **BigInt2
+     system** — scoped to modular/algebraic arithmetic. Every demonstrated
+     example is field work: RSA (the Automata 180× case was modular
+     exponentiation, not a hash), elliptic curve operations, BLS pairing
+     pieces, `add128`. The MLIR `bigint` dialect's first-class primitives
+     are big-int add/mul/reduce; **bitwise XOR and fixed-bit rotations**
+     (what BLAKE3 needs) aren't natively expressible. There is no public
+     evidence of *any* hash precompile authored as an app-defined precompile
+     in RZ.
+   - The realistic way to give RZ a BLAKE3 precompile is to **modify the
+     zkVM circuit itself** — similar in constraint-code scope to SP1's
+     PR2615 (~2 KLOC of constraints) but with a much heavier deployment
+     story: verifier coordination, audit, version bump, upstream PR.
+   - So when comparing "RZ as deployed today" vs "SP1 with PR2615 lifted and
+     ported by waddup" the comparison is fair *in terms of what you can
+     actually run*, but RZ has BLAKE3-acceleration headroom that's
+     meaningfully more expensive to unlock than SP1's was. (Earlier drafts
+     of this document overstated the symmetry; corrected here.)
+
+2. **Recursion lives at different layers.** RZ's segment continuation is
+   built into the prover — 36 segments → lift → pairwise join → one
+   receipt, no application code involved, recursion verifier specialised
+   for "this is another rv32im segment of the same execution" and cheap
+   per merge. SP1 decomposed uses `verify_sp1_proof` inside a user program;
+   each chunk proof pays an ~80-90 s `.compressed()` recursion-compression
+   tax before the root can witness it, and the root is also `.compressed()`
+   for the same reason. **Of the SP1 decomposed 1 MiB wall-clock, roughly
+   ~1440 s (≈ 16 × 90 s) is recursion-compression overhead that has no
+   structural equivalent in RZ.** If SP1 shipped automatic continuation
+   the way RZ does, that tax would mostly vanish; absent that, it's a real
+   cost that shows up as wall clock.
+
+3. **Soundness is not symmetric.** RZ's circuits are audited production
+   code. The SP1 BLAKE3 chip we ported (PR #2615 forward-ported to v6.2.2)
+   is **knowingly under-constrained** in three places (`trap_code` zeroed,
+   no Supervisor/User mode split, missing page-prot interaction lookups —
+   see Finding 1 and `sp1-pr2615-patches/README.md`). For *measuring
+   proving time* this is fine — the bytes flow correctly, the hashes match.
+   For *deploying to verifiers accepting proofs from untrusted seeders* it's
+   not — a malicious prover could potentially substitute different bytes
+   while still producing a valid receipt. **The SP1 decomposed 1 MiB receipt
+   is not safe to ship**; that asymmetry doesn't show up in wall-clock
+   numbers.
+
+4. **The 1 MiB cell isn't quite apples-to-apples on memory either.** Both
+   stay below the 64 GiB ceiling, but RZ's segment model keeps a flatter
+   working set throughout the run (no warnings observed), while SP1
+   decomposed peaks at ~53 GiB (86%) during the root proof that verifies
+   16 sub-proofs. The "memory bounded per sub-proof" property of
+   decomposition only applies to the leaf sub-proofs, not the root. A
+   production decomposition would replace the fan-in root with a binary
+   tree of merge-proofs to keep the root small too; we didn't build that.
+
+5. **Neither receipt is Groth16-compressed.** Both stop at
+   compressed-STARK. For on-chain verification each would need a final
+   Groth16 compression step (~30-60 s, applied once at the root,
+   approximately equal for both provers) on top of the wall-clock numbers
+   shown. Doesn't change the rankings.
+
+6. **Tiny host-side optimisation in SP1.** The SP1 decomposed host
+   precomputes SHA-256 boundary states natively (~50 ms / MiB on this CPU)
+   and feeds them to chunk provers. The chunk-prover's SHA-256 work
+   re-derives the same boundaries inside the proof, and the root's chain
+   check enforces they agree — so this is "doing SHA-256 twice for 1 MiB."
+   Wall-clock impact is rounding error and the proof guarantees are
+   unchanged.
+
+**Reading the table fairly:** the bare numbers answer *"which prover should
+I use as deployed today, given current ecosystem state, for this workload
+on this hardware?"* and that's the comparison the matrix accurately
+reflects. They don't answer *"which prover has the structurally faster
+underlying machinery for this workload?"* — because RZ has BLAKE3-precompile
+headroom we didn't tap (because tapping it is much more invasive than for
+SP1), and SP1 paid recursion-compression overhead it wouldn't pay if SP1
+shipped automatic continuation. Those would be separate investigations.
