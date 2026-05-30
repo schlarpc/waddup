@@ -117,20 +117,32 @@ pub fn blake3(input: &[u8]) -> [u8; 32] {
     let mut stack: [[u32; 8]; 64] = [[0u32; 8]; 64];
     let mut stack_len: usize = 0;
 
+    let num_chunks = (input.len() + CHUNK_LEN - 1) / CHUNK_LEN;
     for (i, chunk) in input.chunks(CHUNK_LEN).enumerate() {
+        let is_last_chunk = i == num_chunks - 1;
         let cv = hash_chunk(chunk, i as u64, false);
         let mut new_cv = cv;
         let mut total = i as u64 + 1;
         while (total & 1) == 0 && stack_len > 0 {
             let left = stack[stack_len - 1];
             stack_len -= 1;
-            new_cv = parent_cv(&left, &new_cv, false);
-            total >>= 1;
+            let next_total = total >> 1;
+            // A merge produces the ROOT iff (a) we won't add any more chunks,
+            // (b) we won't keep merging this loop (next iter would fail
+            // (total & 1) == 0), and (c) the stack is now empty. For powers
+            // of 2 (1024 chunks for 1 MiB input etc.) the entire tree folds
+            // up inside this loop and the final-reduction below never runs.
+            let is_root =
+                is_last_chunk && stack_len == 0 && (next_total & 1) == 1;
+            new_cv = parent_cv(&left, &new_cv, is_root);
+            total = next_total;
         }
         stack[stack_len] = new_cv;
         stack_len += 1;
     }
 
+    // Final reduction for non-power-of-2 chunk counts. ROOT goes on the very
+    // last merge.
     let mut current = stack[stack_len - 1];
     stack_len -= 1;
     while stack_len > 0 {
