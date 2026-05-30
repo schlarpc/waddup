@@ -1,0 +1,19 @@
+[package]
+name = "sp1-bench-script"
+version = "0.1.0"
+edition = "2021"
+default-run = "sp1-bench"
+
+[[bin]]
+name = "sp1-bench"
+path = "src/main.rs"
+
+[dependencies]
+sp1-sdk = { workspace = true }
+sha2 = { workspace = true }
+tiny-keccak = { workspace = true }
+blake3 = { version = "1.5" }
+hex = "0.4"
+
+[build-dependencies]
+sp1-build = { workspace = true }

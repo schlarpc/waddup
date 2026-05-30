@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "script",
+    "programs/precompiles-lib",
+    "programs/hash-prover",
+    "programs/sha256-only",
+    "programs/sha3-only",
+]
+
+[workspace.dependencies]
+sp1-zkvm = "6.0"
+sp1-sdk = { version = "6.0", features = ["blocking", "profiling"] }
+sp1-build = "6.0"
+sha2 = "=0.10.8"
+tiny-keccak = { version = "2.0", features = ["sha3"] }
+blake3 = { version = "1.5", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = true
+
+# Note: the documented `sp1-patches/RustCrypto-hashes` and `sp1-patches/tiny-keccak`
+# branches are stale for SP1 v6.x (riscv32-gated cfg + u32-pointer syscall ABI)
+# so they silently fall back to pure software. We avoid them entirely and call
+# the precompile syscalls directly from `sp1-precompiles-lib`. The host uses
+# unpatched `sha2`/`tiny-keccak` for native ground-truth.

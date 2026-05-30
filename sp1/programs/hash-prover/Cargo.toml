@@ -1,0 +1,9 @@
+[package]
+name = "sp1-hash-prover"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sp1-zkvm = { workspace = true }
+sp1-precompiles-lib = { path = "../precompiles-lib" }
+blake3 = { workspace = true }

@@ -1,0 +1,7 @@
+[package]
+name = "sp1-precompiles-lib"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sp1-lib = "6.0"
