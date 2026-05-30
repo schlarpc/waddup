@@ -1,0 +1,19 @@
+[package]
+name = "waddup-root-prover"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+sp1-zkvm = { path = "../../crates/zkvm/entrypoint", features = ["verify"] }
+sp1-lib = { path = "../../crates/zkvm/lib", features = ["verify"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+overflow-checks = false
+debug-assertions = false

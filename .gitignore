@@ -2,3 +2,6 @@
 /sp1/target
 /sp1-pr2615-bench/program/target/
 /sp1-pr2615-bench/script/target/
+/sp1-pr2615-bench-decomposed/chunk-program/target/
+/sp1-pr2615-bench-decomposed/root-program/target/
+/sp1-pr2615-bench-decomposed/script/target/

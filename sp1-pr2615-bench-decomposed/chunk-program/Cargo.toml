@@ -1,0 +1,19 @@
+[package]
+name = "waddup-chunk-prover"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+sp1-zkvm = { path = "../../crates/zkvm/entrypoint" }
+sp1-lib = { path = "../../crates/zkvm/lib" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+overflow-checks = false
+debug-assertions = false
