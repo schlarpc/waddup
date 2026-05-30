@@ -44,7 +44,9 @@ that themselves do not support HIP:
 
 Sister STARK GPU libraries are similarly Nvidia-only — Ingonyama [ICICLE][icicle]
 (the dominant ZK GPU lib, supports BabyBear NTTs) is CUDA + CPU only; Plonky3 and
-Stwo have no GPU backends merged at all.
+Stwo have no GPU backends merged at all. Note: RISC Zero is BabyBear; SP1 v6.2
+moved to **KoalaBear** (p = 2^31 − 2^24 + 1) — any GPU NTT effort for one
+prover does not lift to the other for free.
 
 ### The one credible path: RISC Zero PR #3725 (CubeCL HAL)
 
@@ -371,6 +373,73 @@ be properly mode-split and trap-aware.
 
 [s2615]: https://github.com/succinctlabs/sp1/pull/2615
 
+### Finding 6 — Porting RISC Zero's SHA-256 precompile into SP1 is chip-rewrite, not port
+
+Whether SP1's relatively expensive SHA-256 precompile (6.5 c/B, vs RZ's 1.2)
+could be improved by porting RZ's design over was an open question after the
+benchmarks. After reading both source trees the honest answer is **months of
+work using RZ as a design reference, not a "port" in any code-reuse sense.**
+Concrete surfaces of mismatch:
+
+- **Constraint DSL.** RZ's SHA-256 constraints live in
+  [zirgen][zirgen] (`sha2.zir`, `inst_sha.zir`) — a domain-specific compiler
+  language that lowers to MLIR and code-generates a ~1 MiB `poly_ext.rs`
+  used by RZ's prover. SP1 is hand-written Plonky3 AIR via `slop_air::Air::eval`
+  (e.g. `crates/core/machine/src/syscall/precompiles/sha256/compress/air.rs`,
+  ~520 LOC). Zirgen primitives (`NondetBitReg`, `AliasLayout!`, `OneHot<N>`,
+  `LookupDelta` externs, parametric components, `reduce ... init ... with ...`)
+  have **no equivalent** in SP1's AIR builder. The `.zir` is a specification
+  to translate from, not code to copy.
+
+- **Field arithmetic.** RZ uses BabyBear (p = 15·2^27 + 1). **SP1 v6.2.2 uses
+  KoalaBear (p = 2^31 − 2^24 + 1)** — both small but materially different
+  field moduli, different NTT-friendly factorizations, different limb sizes,
+  different range-check tables. The arithmetic isn't directly translatable.
+
+- **u32 packing.** RZ stores u32 in memory as `ValU32 { low: u16, high: u16 }`
+  and SHA round arithmetic operates on **32 bit registers** with bitwise
+  `BitXor`/`MajU32`/`ChU32` primitives. SP1 packs `Word<T> = [T; 4]` as
+  four u16 limbs (representing 64 bits) and implements `XorU32Operation` via
+  **byte-XOR lookups** against a global byte table. Two completely different
+  encodings for the same primitive — no reusable constraint forms.
+
+- **Memory + syscall model.** RZ's SHA-256 isn't an ECALL precompile at all;
+  it's an integrated set of cycle-states (`ShaEcall`, `ShaLoadState`,
+  `ShaLoadData`, `ShaMix`, `ShaStoreState`) driven by the rv32im top-level
+  state machine, with word-granular addressing into a paged memory argument.
+  SP1's ABI is ECALL with `(w_ptr, h_ptr)`, 8-byte slot addressing
+  (`w_ptr + i * 8`), 48-bit clk decomposition (`clk_high`, `clk_low`),
+  `MemoryAccessTimestamp` chips, and separate Supervisor/User page-prot
+  interactions. RZ's "chip is part of the rv32im state machine" design
+  doesn't fit SP1's "chip is a separate syscall handler" architecture
+  even structurally.
+
+- **Lookup architecture.** RZ uses Plonk-style polynomial-commitment lookups
+  with `LookupDelta`/`LookupCurrent` externs in the generated code. SP1
+  Hypercube uses LogUp on multilinear extensions with typed interaction
+  buses (`InteractionKind::ShaExtend`, `Memory`, `Byte`, etc., with
+  `InteractionScope::Local|Global`). Different proof-system primitives;
+  multiplicity bookkeeping must be re-authored end-to-end.
+
+- **Prover glue.** SP1's existing SHA-256 precompile alone is ~2,610 LOC of
+  hand-written Rust across `extend/{air,columns,controller,trace,mod}.rs`,
+  `compress/{air,columns,controller,trace,mod}.rs`, and the executor's two
+  syscall handlers. That's not counting syscall-code registration, RiscvAirId
+  enumeration, byte-lookup operations consumed (`XorU32Operation`,
+  `AndU32Operation`, `FixedRotateRightOperation`, etc.), recursion-verifier
+  wiring, the cost-model entry in `rv64im_costs.json`, and the
+  Supervisor/User mode doubling of the controller. The RZ `.zir` is ~380
+  LOC across `sha2.zir` + `inst_sha.zir` because zirgen does the heavy
+  lifting — you can't lift that compactness back into hand-written Rust.
+
+**What's free:** the SHA-256 spec itself (NIST FIPS 180-4 round function,
+message schedule, K table, IVs). Everything else must be re-implemented
+for SP1's architecture using RZ's circuit as a design reference, not a
+porting target. Estimate is months for someone fluent in SP1 internals, not
+the days the user budgeted. Not pursued here.
+
+[zirgen]: https://github.com/risc0/zirgen
+
 ### NixOS-specific friction (worth documenting)
 
 For reproducibility on NixOS:
@@ -394,15 +463,25 @@ For reproducibility on NixOS:
 1. **AMD GPU is not an option today** for either prover. Watch RISC Zero PR
    #3725. Native Linux is still worth it for CPU throughput; the cross-prover
    comparison above is on a competent but not state-of-the-art CPU.
-2. **For the waddup proof (SHA-256 + BLAKE3)** as it stands today (no BLAKE3
-   precompile in either prover), the choice between SP1 and RISC Zero is a
-   size-dependent tradeoff: RISC Zero wins on small files (faster fixed cost),
-   SP1 wins on medium-to-large files (better scaling). The crossover for this
-   workload is somewhere around 10-30 KiB on CPU.
-3. **Adding a BLAKE3 precompile** (SP1 PR or RISC Zero app-defined) would be a
-   larger win than the prover choice. Plan the engineering effort there if
-   proving cost is the bottleneck.
+2. **For the waddup proof (SHA-256 + BLAKE3)** as it stands today, the choice
+   between SP1 and RISC Zero is a size-dependent tradeoff: RISC Zero wins on
+   small files (faster fixed cost), SP1 wins on medium-to-large files (better
+   scaling). The crossover for this workload sits between 1 KiB and 10 KiB on
+   CPU.
+3. **Adding a BLAKE3 precompile** is a larger win than the prover choice for
+   cycle counts. We ported SP1 PR #2615 forward and measured an 8.3x BLAKE3
+   cycle reduction. Wall-clock proving improvement is more modest (13% at
+   100 KiB) because SP1's fixed proving overhead dominates. The cycle
+   reduction would matter more at proof-batching or larger sizes. RISC Zero
+   has the same option via app-defined precompiles. **In neither case is the
+   chip safe to deploy without an audit.**
 4. **The SP1 ecosystem has rough edges on v6.x.** The official precompile
-   patches don't dispatch; without fixing this you get pure-software hashes and
-   ~10x worse cycle counts. Worth filing upstream and worth doing the trivial
-   workaround in any real SP1 deployment.
+   patches don't dispatch; without fixing this you get pure-software hashes
+   and ~10x worse cycle counts. Worth filing upstream and worth doing the
+   trivial workaround in any real SP1 deployment.
+5. **"Just port RZ's SHA-256 chip to SP1" is not a real option.** Different
+   constraint DSL (zirgen vs hand-Plonky3), different field (BabyBear vs
+   KoalaBear), different u32 encoding, different memory model, different
+   lookup architecture. The SHA-256 *algorithm* is shared (NIST FIPS 180-4)
+   but no constraint, no row layout, no interaction is portable verbatim.
+   Months of work using RZ as a design reference, not weeks of porting.
