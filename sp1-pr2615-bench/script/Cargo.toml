@@ -1,0 +1,17 @@
+[package]
+name = "waddup-bench-script"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "waddup-bench"
+path = "src/main.rs"
+
+[dependencies]
+sp1-sdk = { path = "../../crates/sdk", features = ["blocking", "profiling"] }
+sha2 = "0.10"
+blake3 = "1.5"
+hex = "0.4"
+
+[build-dependencies]
+sp1-build = { path = "../../crates/build" }

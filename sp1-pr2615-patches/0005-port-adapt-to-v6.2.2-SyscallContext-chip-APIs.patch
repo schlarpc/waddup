@@ -1,0 +1,375 @@
+From 639be92b2fa1e01fffee0a0647743b035ef922d4 Mon Sep 17 00:00:00 2001
+From: PR Port <port@local>
+Date: Sat, 30 May 2026 01:49:33 -0700
+Subject: port: adapt to v6.2.2 SyscallContext + chip APIs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The PR was based on SP1 v6.0.1. Between then and v6.2.2 main:
+
+1. SyscallContext / SyscallRuntime API changed:
+   - per-word `mr()` / `mw()` accessors removed in favour of
+     `mr_slice_without_prot()` (returns `Vec<MemoryReadRecord>`) and
+     `mw_slice_without_prot(addr, &[u64])`
+   - permission checks moved into `trap_*` helpers that return
+     `(PageProtAccess, Option<TrapError>)`
+   - `postprocess_precompile()` now returns a tuple of (mem_events, page_prot_events)
+   - `syscall_event(...)` takes 9 args including the `is_trap` option
+   - `SyscallRuntime` is parametrized by `<'a, M: ExecutionMode>` rather than `<'a>`
+
+   The minimal (executor) and vm (tracing) BLAKE3 handlers are rewritten to
+   match, modeled on `sha256_compress`. Functional semantics unchanged.
+
+2. `receive_syscall(...)` gained a `trap_code` arg in v6.2.2. The Blake3
+   controller chip passes `AB::Expr::zero()` (no trap) — correct for the happy
+   path but means the chip is under-constrained for trap cases. Acceptable for
+   benchmark; NOT safe to ship without an audit / proper port.
+
+Soundness caveat: the controller still lacks the SupervisorMode/UserMode split
+and the AddressSlicePageProtOperation evals that v6.2.2's sha256/keccak
+controllers have. Re-doing those properly is part of a "real" port.
+---
+ .../src/minimal/precompiles/blake3.rs         |  41 +++--
+ .../src/vm/syscall/precompiles/blake3/mod.rs  | 164 ++++++++++++------
+ .../precompiles/blake3/compress/controller.rs |   5 +-
+ 3 files changed, 139 insertions(+), 71 deletions(-)
+
+diff --git a/crates/core/executor/src/minimal/precompiles/blake3.rs b/crates/core/executor/src/minimal/precompiles/blake3.rs
+index eb7938228..b8cf35c51 100644
+--- a/crates/core/executor/src/minimal/precompiles/blake3.rs
++++ b/crates/core/executor/src/minimal/precompiles/blake3.rs
+@@ -1,4 +1,4 @@
+-use sp1_jit::SyscallContext;
++use sp1_jit::{Interrupt, SyscallContext};
+ 
+ /// Full Blake3 message schedule for 7 rounds.
+ /// Matches the official Blake3 reference: https://github.com/BLAKE3-team/BLAKE3
+@@ -37,38 +37,45 @@ fn g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my:
+ 
+ /// The Blake3 inner compress syscall for the minimal executor.
+ ///
+-/// Arguments:
+-///   - `arg1` (a0): pointer to 16-word state array (in/out), each word at offset `i * 8`
+-///   - `arg2` (a1): pointer to 16-word message array (read-only), each word at offset `j * 8`
+-///
+-/// # Safety
+-/// - The memory in `ctx` is valid for the duration of the function call.
++/// Ported forward from PR #2615 (based on SP1 v6.0.1) to the v6.2.2
++/// `SyscallContext` API: the old `mr`/`mw` direct accessors were removed in
++/// favour of slice + perm-check variants. Modeled after the keccak handler.
+ #[allow(clippy::pedantic)]
+ pub(crate) unsafe fn blake3_compress_inner(
+     ctx: &mut impl SyscallContext,
+     arg1: u64,
+     arg2: u64,
+-) -> Option<u64> {
++) -> Result<Option<u64>, Interrupt> {
+     let state_ptr = arg1;
+     let msg_ptr = arg2;
+ 
+-    // Phase 1: Read the 16 state words.
++    let clk = ctx.get_current_clk();
++    ctx.read_slice_check(state_ptr, 16)?;
++    ctx.bump_memory_clk();
++    ctx.read_slice_check(msg_ptr, 16)?;
++    ctx.bump_memory_clk();
++    ctx.write_slice_check(state_ptr, 16)?;
++
++    ctx.set_clk(clk);
++
++    let state_vals: Vec<u64> =
++        ctx.mr_slice_without_prot(state_ptr, 16).into_iter().copied().collect();
+     let mut state = [0u32; 16];
+     for i in 0..16 {
+-        state[i] = ctx.mr(state_ptr + i as u64 * 8) as u32;
++        state[i] = state_vals[i] as u32;
+     }
+ 
+     ctx.bump_memory_clk();
+ 
+-    // Phase 2: Read the 16 message words.
++    let msg_vals: Vec<u64> =
++        ctx.mr_slice_without_prot(msg_ptr, 16).into_iter().copied().collect();
+     let mut msg = [0u32; 16];
+     for j in 0..16 {
+-        msg[j] = ctx.mr(msg_ptr + j as u64 * 8) as u32;
++        msg[j] = msg_vals[j] as u32;
+     }
+ 
+     ctx.bump_memory_clk();
+ 
+-    // Compute Blake3 compression: 7 rounds of 8 G operations each.
+     for round in 0..7 {
+         for op in 0..8 {
+             let [a, b, c, d] = G_INDEX[op];
+@@ -78,10 +85,8 @@ pub(crate) unsafe fn blake3_compress_inner(
+         }
+     }
+ 
+-    // Phase 3: Write the 16 state output words.
+-    for i in 0..16 {
+-        ctx.mw(state_ptr + i as u64 * 8, state[i] as u64);
+-    }
++    let state_out: [u64; 16] = std::array::from_fn(|i| state[i] as u64);
++    ctx.mw_slice_without_prot(state_ptr, &state_out);
+ 
+-    None
++    Ok(None)
+ }
+diff --git a/crates/core/executor/src/vm/syscall/precompiles/blake3/mod.rs b/crates/core/executor/src/vm/syscall/precompiles/blake3/mod.rs
+index f8a232f63..ef2a9f2d2 100644
+--- a/crates/core/executor/src/vm/syscall/precompiles/blake3/mod.rs
++++ b/crates/core/executor/src/vm/syscall/precompiles/blake3/mod.rs
+@@ -1,11 +1,29 @@
++//! Blake3 inner compress tracing syscall handler.
++//!
++//! Ported forward from PR #2615 (based on SP1 v6.0.1) to the v6.2.2
++//! `SyscallRuntime` API. The new API:
++//!   - The per-word `rt.mr(addr)` / `rt.mw(addr)` accessors are removed in
++//!     favour of slice helpers that return `Vec<Memory{Read,Write}Record>`.
++//!   - Page-permission checks moved into a `trap_*` helper modelled on
++//!     `trap_sha256_compress`.
++//!   - `rt.postprocess_precompile()` now returns a tuple
++//!     `(Vec<MemoryLocalEvent>, Vec<PageProtLocalEvent>)`.
++//!   - `rt.syscall_event(...)` now takes 9 args including the `is_trap` flag
++//!     and the `SyscallRuntime` trait is parametrized by `<'a, M>` rather than
++//!     `<'a>`.
++//!
++//! Functional semantics (compress_inner: 7 rounds × 8 G-ops, no XOR
++//! finalization) are unchanged from the PR.
++
+ use crate::{
+-    events::{Blake3CompressEvent, PrecompileEvent},
++    events::{
++        Blake3CompressEvent, Blake3CompressPageProtAccess, MemoryReadRecord,
++        MemoryWriteRecord, PrecompileEvent,
++    },
+     vm::syscall::SyscallRuntime,
+-    SyscallCode,
++    ExecutionMode, SyscallCode, TrapError,
+ };
+ 
+-/// Full Blake3 message schedule for 7 rounds.
+-/// Matches the official Blake3 reference: https://github.com/BLAKE3-team/BLAKE3
+ const MSG_SCHEDULE: [[usize; 16]; 7] = [
+     [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+     [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8],
+@@ -16,7 +34,6 @@ const MSG_SCHEDULE: [[usize; 16]; 7] = [
+     [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13],
+ ];
+ 
+-/// G_INDEX: for each of the 8 column operations in a round, the 4 state indices.
+ const G_INDEX: [[usize; 4]; 8] = [
+     [0, 4, 8, 12],
+     [1, 5, 9, 13],
+@@ -28,7 +45,6 @@ const G_INDEX: [[usize; 4]; 8] = [
+     [3, 4, 9, 14],
+ ];
+ 
+-/// Execute the Blake3 G function in-place on state.
+ fn g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
+     state[a] = state[a].wrapping_add(state[b]).wrapping_add(mx);
+     state[d] = (state[d] ^ state[a]).rotate_right(16);
+@@ -40,64 +56,88 @@ fn g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my:
+     state[b] = (state[b] ^ state[c]).rotate_right(7);
+ }
+ 
+-/// Executor handler for the Blake3 inner compress syscall.
+-///
+-/// Arguments:
+-///   - `arg1` (a0): pointer to 16-word state array (in/out)
+-///   - `arg2` (a1): pointer to 16-word message array (read-only)
+-pub(crate) fn blake3_compress_inner<'a, RT: SyscallRuntime<'a>>(
++fn trap_blake3_compress<'a, M: ExecutionMode, RT: SyscallRuntime<'a, M>>(
++    rt: &mut RT,
++    state_ptr: u64,
++    msg_ptr: u64,
++) -> (Blake3CompressPageProtAccess, Option<TrapError>) {
++    let mut ret = Blake3CompressPageProtAccess::default();
++
++    let (state_read_records, state_read_error) = rt.read_slice_check(state_ptr, 16);
++    ret.state_read_page_prot_records = state_read_records;
++    if state_read_error.is_some() {
++        return (ret, state_read_error);
++    }
++
++    rt.increment_clk();
++    let (msg_read_records, msg_read_error) = rt.read_slice_check(msg_ptr, 16);
++    ret.msg_read_page_prot_records = msg_read_records;
++    if msg_read_error.is_some() {
++        return (ret, msg_read_error);
++    }
++
++    rt.increment_clk();
++    let (state_write_records, state_write_error) = rt.write_slice_check(state_ptr, 16);
++    ret.state_write_page_prot_records = state_write_records;
++    if state_write_error.is_some() {
++        return (ret, state_write_error);
++    }
++
++    (ret, None)
++}
++
++pub(crate) fn blake3_compress_inner<'a, M: ExecutionMode, RT: SyscallRuntime<'a, M>>(
+     rt: &mut RT,
+     syscall_code: SyscallCode,
+     arg1: u64,
+     arg2: u64,
+-) -> Option<u64> {
++) -> Result<Option<u64>, TrapError> {
+     let state_ptr = arg1;
+     let msg_ptr = arg2;
+ 
+     let clk = rt.core().clk();
+ 
+-    // Phase 1: Read the 16 state words.
++    let (page_prot_access, is_trap) = trap_blake3_compress(rt, state_ptr, msg_ptr);
++
++    let mut state_read_records: Vec<MemoryReadRecord> = Vec::new();
++    let mut msg_read_records: Vec<MemoryReadRecord> = Vec::new();
++    let mut state_write_records: Vec<MemoryWriteRecord> = Vec::new();
+     let mut state_in = [0u32; 16];
+-    let mut state_read_records = Vec::with_capacity(16);
+-    for i in 0..16 {
+-        let record = rt.mr(state_ptr + i as u64 * 8);
+-        state_in[i] = record.value as u32;
+-        state_read_records.push(record);
+-    }
++    let mut state_out = [0u32; 16];
++    let mut msg = [0u32; 16];
+ 
+-    rt.increment_clk();
++    rt.reset_clk(clk);
++    if is_trap.is_none() {
++        state_read_records = rt.mr_slice_without_prot(state_ptr, 16);
++        for (i, r) in state_read_records.iter().enumerate() {
++            state_in[i] = r.value as u32;
++        }
+ 
+-    // Phase 2: Read the 16 message words.
+-    let mut msg = [0u32; 16];
+-    let mut msg_read_records = Vec::with_capacity(16);
+-    for j in 0..16 {
+-        let record = rt.mr(msg_ptr + j as u64 * 8);
+-        msg[j] = record.value as u32;
+-        msg_read_records.push(record);
+-    }
++        rt.increment_clk();
++        msg_read_records = rt.mr_slice_without_prot(msg_ptr, 16);
++        for (j, r) in msg_read_records.iter().enumerate() {
++            msg[j] = r.value as u32;
++        }
+ 
+-    rt.increment_clk();
++        rt.increment_clk();
+ 
+-    // Compute Blake3 compression.
+-    let mut state = state_in;
+-    for round in 0..7 {
+-        for op in 0..8 {
+-            let [a, b, c, d] = G_INDEX[op];
+-            let mx = msg[MSG_SCHEDULE[round][2 * op]];
+-            let my = msg[MSG_SCHEDULE[round][2 * op + 1]];
+-            g(&mut state, a, b, c, d, mx, my);
++        let mut state = state_in;
++        for round in 0..7 {
++            for op in 0..8 {
++                let [a, b, c, d] = G_INDEX[op];
++                let mx = msg[MSG_SCHEDULE[round][2 * op]];
++                let my = msg[MSG_SCHEDULE[round][2 * op + 1]];
++                g(&mut state, a, b, c, d, mx, my);
++            }
+         }
+-    }
+-    let state_out = state;
++        state_out = state;
+ 
+-    // Phase 3: Write the 16 state words.
+-    let mut state_write_records = Vec::with_capacity(16);
+-    for i in 0..16 {
+-        let record = rt.mw(state_ptr + i as u64 * 8);
+-        state_write_records.push(record);
++        state_write_records = rt.mw_slice_without_prot(state_ptr, 16);
+     }
+ 
+     if RT::TRACING {
++        let (local_mem_access, local_page_prot_access) = rt.postprocess_precompile();
++
+         let event = PrecompileEvent::Blake3CompressInner(Blake3CompressEvent {
+             clk,
+             state_ptr,
+@@ -105,23 +145,43 @@ pub(crate) fn blake3_compress_inner<'a, RT: SyscallRuntime<'a>>(
+             state_in,
+             state_out,
+             msg,
+-            state_read_records: state_read_records.try_into().unwrap(),
+-            msg_read_records: msg_read_records.try_into().unwrap(),
+-            state_write_records: state_write_records.try_into().unwrap(),
+-            local_mem_access: rt.postprocess_precompile(),
+-            ..Default::default()
++            state_read_records: if state_read_records.len() == 16 {
++                state_read_records.try_into().unwrap()
++            } else {
++                [MemoryReadRecord::default(); 16]
++            },
++            msg_read_records: if msg_read_records.len() == 16 {
++                msg_read_records.try_into().unwrap()
++            } else {
++                [MemoryReadRecord::default(); 16]
++            },
++            state_write_records: if state_write_records.len() == 16 {
++                state_write_records.try_into().unwrap()
++            } else {
++                [MemoryWriteRecord::default(); 16]
++            },
++            local_mem_access,
++            page_prot_access,
++            local_page_prot_access,
+         });
++
+         let syscall_event = rt.syscall_event(
+             clk,
+             syscall_code,
+             arg1,
+             arg2,
+-            false,
+             rt.core().next_pc(),
+             rt.core().exit_code(),
++            None,
++            None,
++            is_trap,
+         );
+         rt.add_precompile_event(syscall_code, syscall_event, event);
+     }
+ 
+-    None
++    if let Some(err) = is_trap {
++        return Err(err);
++    }
++
++    Ok(None)
+ }
+diff --git a/crates/core/machine/src/syscall/precompiles/blake3/compress/controller.rs b/crates/core/machine/src/syscall/precompiles/blake3/compress/controller.rs
+index 21cca9ab8..9e52a3496 100644
+--- a/crates/core/machine/src/syscall/precompiles/blake3/compress/controller.rs
++++ b/crates/core/machine/src/syscall/precompiles/blake3/compress/controller.rs
+@@ -207,11 +207,14 @@ where
+             local.is_real.into(),
+         );
+ 
+-        // Receive the syscall.
++        // Receive the syscall. v6.2.2 added a `trap_code` arg; the PR predates
++        // it. We pass zero (no trap), which is correct for the happy path but
++        // means this chip would be under-constrained for traps. Benchmark-only.
+         builder.receive_syscall(
+             local.clk_high,
+             local.clk_low,
+             AB::F::from_canonical_u32(SyscallCode::BLAKE3_COMPRESS_INNER.syscall_id()),
++            AB::Expr::zero(),
+             state_ptr.map(Into::into),
+             msg_ptr.map(Into::into),
+             local.is_real,
+-- 
+2.51.2
+

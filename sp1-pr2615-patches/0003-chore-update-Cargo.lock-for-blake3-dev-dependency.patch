@@ -1,0 +1,25 @@
+From 84b82f8acd096f7af31c649eaad2fdc968295d4e Mon Sep 17 00:00:00 2001
+From: Swapnil Raj <raj.swapnil99@gmail.com>
+Date: Sun, 22 Feb 2026 16:57:25 +0000
+Subject: chore: update Cargo.lock for blake3 dev-dependency
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ Cargo.lock | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index fdff6c103..df5ab53c8 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -6943,6 +6943,7 @@ name = "sp1-core-machine"
+ version = "6.2.2"
+ dependencies = [
+  "bincode",
++ "blake3",
+  "cfg-if",
+  "enum-map",
+  "futures",
+-- 
+2.51.2
+

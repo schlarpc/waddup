@@ -487,3 +487,67 @@ Mode:   SHA-256 (precompile) + BLAKE3 (software)
   Proving time:        73.026682282s
   Verification time:   92.023136ms
 
+=== SP1+PR2615 BLAKE3 precompile bench === 2026-05-30T08:48:17Z
+waddup SP1 BLAKE3-precompile bench (PR #2615 ported to v6.2.2)
+===============================================================
+
+--- SHA-256 (precompile) + BLAKE3 (PR #2615 precompile) | 1 KiB (1024 bytes) ---
+  SHA-256 (journal):   785b0751fc2c53dc14a4ce3d800e69ef9ce1009eb327ccf458afe09c242c26c9
+  SHA-256 (native):    785b0751fc2c53dc14a4ce3d800e69ef9ce1009eb327ccf458afe09c242c26c9
+  SHA-256 match:       OK
+  BLAKE3  (journal):   882179b8dbccd285cda241d968cfcccb3156c5edac2fa3761bb6eda7ff8cb172
+  BLAKE3  (native):    882179b8dbccd285cda241d968cfcccb3156c5edac2fa3761bb6eda7ff8cb172
+  BLAKE3  match:       OK
+  Total user cycles:   21954
+  Cycle tracker regions:
+    blake3:            3383 cycles (3.30 cycles/byte)
+    sha256:            8673 cycles (8.47 cycles/byte)
+  Syscall counts (non-zero):
+    BLAKE3_COMPRESS_INNER      16
+    SHA_COMPRESS               17
+    SHA_EXTEND                 17
+  Execute time:        9.251827ms
+  Setup time:          1.968282889s
+  Proving time:        26.580917511s
+  Verification time:   132.870679ms
+
+--- SHA-256 (precompile) + BLAKE3 (PR #2615 precompile) | 10 KiB (10240 bytes) ---
+  SHA-256 (journal):   e96760a87768717bcebcfd25ddc7d46b4dbc95a4b0014def080c08539f7d90d0
+  SHA-256 (native):    e96760a87768717bcebcfd25ddc7d46b4dbc95a4b0014def080c08539f7d90d0
+  SHA-256 match:       OK
+  BLAKE3  (journal):   398d42d5677b8bc40eb177ea45565bea3fc2fec2927c80304424c244435f9a78
+  BLAKE3  (native):    398d42d5677b8bc40eb177ea45565bea3fc2fec2927c80304424c244435f9a78
+  BLAKE3  match:       OK
+  Total user cycles:   111232
+  Cycle tracker regions:
+    blake3:            33045 cycles (3.23 cycles/byte)
+    sha256:            68289 cycles (6.67 cycles/byte)
+  Syscall counts (non-zero):
+    BLAKE3_COMPRESS_INNER      169
+    SHA_COMPRESS               161
+    SHA_EXTEND                 161
+  Execute time:        13.916183ms
+  Setup time:          1.987808024s
+  Proving time:        28.645180254s
+  Verification time:   139.140916ms
+
+--- SHA-256 (precompile) + BLAKE3 (PR #2615 precompile) | 100 KiB (102400 bytes) ---
+  SHA-256 (journal):   27783e87963a4efb6829b531c9ba57b44f45797f6770bd637fbf0d807cbdbae0
+  SHA-256 (native):    27783e87963a4efb6829b531c9ba57b44f45797f6770bd637fbf0d807cbdbae0
+  SHA-256 match:       OK
+  BLAKE3  (journal):   9f05d49a48b2b787c8f7197ef8d5605978cae6eb8a445b46426b155e0accce44
+  BLAKE3  (native):    9f05d49a48b2b787c8f7197ef8d5605978cae6eb8a445b46426b155e0accce44
+  BLAKE3  match:       OK
+  Total user cycles:   995732
+  Cycle tracker regions:
+    blake3:            321385 cycles (3.14 cycles/byte)
+    sha256:            664449 cycles (6.49 cycles/byte)
+  Syscall counts (non-zero):
+    BLAKE3_COMPRESS_INNER      1699
+    SHA_COMPRESS               1601
+    SHA_EXTEND                 1601
+  Execute time:        52.946461ms
+  Setup time:          1.993677897s
+  Proving time:        63.194825302s
+  Verification time:   130.242468ms
+

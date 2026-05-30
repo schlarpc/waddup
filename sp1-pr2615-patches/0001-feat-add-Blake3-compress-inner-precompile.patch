@@ -1,0 +1,2235 @@
+From 05955402d1bbe17801c758d604ffd04eb1135c47 Mon Sep 17 00:00:00 2001
+From: Swapnil Raj <raj.swapnil99@gmail.com>
+Date: Sun, 22 Feb 2026 16:20:19 +0000
+Subject: feat: add Blake3 compress inner precompile
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Implements the Blake3 compress_inner syscall as a first-class SP1
+precompile, enabling efficient ZK-proven Blake3 hashing.
+
+- Guest stub: syscalls/blake3_compress.rs (ecall via BLAKE3_COMPRESS_INNER)
+- Minimal executor: natively computes compress_inner and writes state back
+- Tracing executor: records memory access events and state_out
+- Event: Blake3CompressEvent with state_in/out, msg, memory records
+- Machine chip (Blake3CompressChip): 104 rows/invocation
+  - 16 state_init + 16 msg_read + 56 compute (one G call/row) + 16 finalize
+  - AIR constraints for G function steps (Add, XOR, RotR 16/12/8/7)
+  - Blake3Compress interaction bus chains rows 0→103→controller
+- Controller chip (Blake3CompressControlChip): 1 row/invocation
+  - Sends interaction at index=0 with initial state + msg
+  - Receives interaction at index=104 with final state
+- SyscallCode: BLAKE3_COMPRESS_INNER = 0x00_01_01_34
+- RiscvAirId: Blake3Compress = 73, Blake3CompressControl = 74
+- InteractionKind: Blake3Compress = 22
+- Test: proves guest program and verifies output matches reference impl
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ crates/core/executor/src/air.rs               |   8 +
+ .../executor/src/artifacts/rv64im_costs.json  |   2 +
+ .../src/events/precompiles/blake3_compress.rs |  51 ++
+ .../executor/src/events/precompiles/mod.rs    |  10 +
+ crates/core/executor/src/minimal/ecall.rs     |   2 +
+ .../src/minimal/precompiles/blake3.rs         |  86 +++
+ .../executor/src/minimal/precompiles/mod.rs   |   1 +
+ crates/core/executor/src/syscall_code.rs      |  12 +
+ crates/core/executor/src/vm/syscall.rs        |   3 +
+ .../src/vm/syscall/precompiles/blake3/mod.rs  | 126 +++++
+ .../src/vm/syscall/precompiles/mod.rs         |   1 +
+ crates/core/machine/src/riscv/mod.rs          |  20 +
+ .../precompiles/blake3/compress/air.rs        | 507 ++++++++++++++++++
+ .../precompiles/blake3/compress/columns.rs    | 128 +++++
+ .../precompiles/blake3/compress/controller.rs | 257 +++++++++
+ .../precompiles/blake3/compress/mod.rs        | 166 ++++++
+ .../precompiles/blake3/compress/trace.rs      | 298 ++++++++++
+ .../src/syscall/precompiles/blake3/mod.rs     |   3 +
+ .../machine/src/syscall/precompiles/mod.rs    |   1 +
+ crates/hypercube/src/lookup/interaction.rs    |   8 +
+ crates/test-artifacts/programs/Cargo.lock     |   7 +
+ crates/test-artifacts/programs/Cargo.toml     |   1 +
+ .../programs/blake3-compress/Cargo.toml       |   8 +
+ .../programs/blake3-compress/src/main.rs      |  33 ++
+ crates/test-artifacts/src/lib.rs              |   2 +
+ .../src/syscalls/blake3_compress.rs           |  23 +
+ crates/zkvm/entrypoint/src/syscalls/mod.rs    |   5 +
+ 27 files changed, 1769 insertions(+)
+ create mode 100644 crates/core/executor/src/events/precompiles/blake3_compress.rs
+ create mode 100644 crates/core/executor/src/minimal/precompiles/blake3.rs
+ create mode 100644 crates/core/executor/src/vm/syscall/precompiles/blake3/mod.rs
+ create mode 100644 crates/core/machine/src/syscall/precompiles/blake3/compress/air.rs
+ create mode 100644 crates/core/machine/src/syscall/precompiles/blake3/compress/columns.rs
+ create mode 100644 crates/core/machine/src/syscall/precompiles/blake3/compress/controller.rs
+ create mode 100644 crates/core/machine/src/syscall/precompiles/blake3/compress/mod.rs
+ create mode 100644 crates/core/machine/src/syscall/precompiles/blake3/compress/trace.rs
+ create mode 100644 crates/core/machine/src/syscall/precompiles/blake3/mod.rs
+ create mode 100644 crates/test-artifacts/programs/blake3-compress/Cargo.toml
+ create mode 100644 crates/test-artifacts/programs/blake3-compress/src/main.rs
+ create mode 100644 crates/zkvm/entrypoint/src/syscalls/blake3_compress.rs
+
+diff --git a/crates/core/executor/src/air.rs b/crates/core/executor/src/air.rs
+index 229995d28..71e36156b 100644
+--- a/crates/core/executor/src/air.rs
++++ b/crates/core/executor/src/air.rs
+@@ -344,6 +344,10 @@ pub enum RiscvAirId {
+     /// The trap memory chip.
+     #[subenum(CoreAirId)]
+     TrapMem = 121,
++    /// The blake3 compress chip.
++    Blake3Compress = 122,
++    /// The blake3 compress control chip.
++    Blake3CompressControl = 123,
+ }
+ 
+ impl RiscvAirId {
+@@ -465,6 +469,7 @@ impl RiscvAirId {
+                 | RiscvAirId::Bn254Fp2MulAssign
+                 | RiscvAirId::Poseidon2
+                 | RiscvAirId::SigReturn
++                | RiscvAirId::Blake3Compress
+         )
+     }
+ 
+@@ -475,6 +480,8 @@ impl RiscvAirId {
+             Self::ShaCompress => 80,
+             Self::ShaExtend => 48,
+             Self::KeccakPermute => 24,
++            // 16 state_init + 16 msg_read + 56 G-compute + 16 finalize = 104
++            Self::Blake3Compress => 104,
+             _ => 1,
+         }
+     }
+@@ -494,6 +501,7 @@ impl RiscvAirId {
+             RiscvAirId::ShaCompress => Some(RiscvAirId::ShaCompressControl),
+             RiscvAirId::ShaExtend => Some(RiscvAirId::ShaExtendControl),
+             RiscvAirId::KeccakPermute => Some(RiscvAirId::KeccakPermuteControl),
++            RiscvAirId::Blake3Compress => Some(RiscvAirId::Blake3CompressControl),
+             _ => None,
+         }
+     }
+diff --git a/crates/core/executor/src/artifacts/rv64im_costs.json b/crates/core/executor/src/artifacts/rv64im_costs.json
+index 4fc77d79f..1dab93f2e 100644
+--- a/crates/core/executor/src/artifacts/rv64im_costs.json
++++ b/crates/core/executor/src/artifacts/rv64im_costs.json
+@@ -111,6 +111,8 @@
+   "Branch": 45,
+   "SyscallCoreUser": 11,
+   "ShaCompressControlUser": 125,
++  "Blake3Compress": 238,
++  "Blake3CompressControl": 117,
+   "Lt": 44,
+   "ShaExtendControl": 18,
+   "StoreWordUser": 45,
+diff --git a/crates/core/executor/src/events/precompiles/blake3_compress.rs b/crates/core/executor/src/events/precompiles/blake3_compress.rs
+new file mode 100644
+index 000000000..d4b227470
+--- /dev/null
++++ b/crates/core/executor/src/events/precompiles/blake3_compress.rs
+@@ -0,0 +1,51 @@
++use deepsize2::DeepSizeOf;
++use serde::{Deserialize, Serialize};
++
++use crate::events::{
++    memory::{MemoryReadRecord, MemoryWriteRecord},
++    MemoryLocalEvent, PageProtLocalEvent, PageProtRecord,
++};
++
++/// Blake3 Compress Page Prot Access.
++///
++/// Tracks page protection access records for the Blake3 compress operation.
++#[derive(Default, Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
++pub struct Blake3CompressPageProtAccess {
++    /// Reading initial state prot records.
++    pub state_read_page_prot_records: Vec<PageProtRecord>,
++    /// Reading message prot records.
++    pub msg_read_page_prot_records: Vec<PageProtRecord>,
++    /// Writing final state prot records.
++    pub state_write_page_prot_records: Vec<PageProtRecord>,
++}
++
++/// Blake3 Compress Event.
++///
++/// This event is emitted when a Blake3 inner compress operation is performed.
++#[derive(Default, Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
++pub struct Blake3CompressEvent {
++    /// The clock cycle.
++    pub clk: u64,
++    /// Pointer to the 16-word state array (in/out).
++    pub state_ptr: u64,
++    /// Pointer to the 16-word message array (read-only).
++    pub msg_ptr: u64,
++    /// The initial state (before compression).
++    pub state_in: [u32; 16],
++    /// The final state (after compression).
++    pub state_out: [u32; 16],
++    /// The message words.
++    pub msg: [u32; 16],
++    /// Memory read records for the initial state.
++    pub state_read_records: [MemoryReadRecord; 16],
++    /// Memory read records for the message.
++    pub msg_read_records: [MemoryReadRecord; 16],
++    /// Memory write records for the final state.
++    pub state_write_records: [MemoryWriteRecord; 16],
++    /// Local memory access events.
++    pub local_mem_access: Vec<MemoryLocalEvent>,
++    /// Page protection access records.
++    pub page_prot_access: Blake3CompressPageProtAccess,
++    /// Local page protection access events.
++    pub local_page_prot_access: Vec<PageProtLocalEvent>,
++}
+diff --git a/crates/core/executor/src/events/precompiles/mod.rs b/crates/core/executor/src/events/precompiles/mod.rs
+index 8892a629a..7d7414497 100644
+--- a/crates/core/executor/src/events/precompiles/mod.rs
++++ b/crates/core/executor/src/events/precompiles/mod.rs
+@@ -1,3 +1,4 @@
++mod blake3_compress;
+ mod ec;
+ mod edwards;
+ mod fptower;
+@@ -14,6 +15,7 @@ mod uint256_ops;
+ use super::{MemoryLocalEvent, PageProtLocalEvent, SyscallEvent};
+ use crate::{deserialize_hashmap_as_vec, serialize_hashmap_as_vec, SyscallCode};
+ use deepsize2::DeepSizeOf;
++pub use blake3_compress::*;
+ pub use ec::*;
+ pub use edwards::*;
+ pub use fptower::*;
+@@ -93,6 +95,8 @@ pub enum PrecompileEvent {
+     POSEIDON2(Poseidon2PrecompileEvent),
+     /// `SigReturn` precompile event.
+     SigReturn(SigReturnEvent),
++    /// Blake3 compress inner precompile event.
++    Blake3CompressInner(Blake3CompressEvent),
+ }
+ 
+ /// Trait to retrieve all the local memory events from a vec of precompile events.
+@@ -162,6 +166,9 @@ impl PrecompileLocalMemory for Vec<(SyscallEvent, PrecompileEvent)> {
+                 PrecompileEvent::POSEIDON2(e) => {
+                     iterators.push(e.local_mem_access.iter());
+                 }
++                PrecompileEvent::Blake3CompressInner(e) => {
++                    iterators.push(e.local_mem_access.iter());
++                }
+                 PrecompileEvent::Mprotect(_) => {
+                     // Mprotect doesn't have local memory access events
+                 }
+@@ -237,6 +244,9 @@ impl PrecompileLocalMemory for Vec<(SyscallEvent, PrecompileEvent)> {
+                 PrecompileEvent::SigReturn(e) => {
+                     iterators.push(e.local_page_prot_access.iter());
+                 }
++                PrecompileEvent::Blake3CompressInner(e) => {
++                    iterators.push(e.local_page_prot_access.iter());
++                }
+             }
+         }
+ 
+diff --git a/crates/core/executor/src/minimal/ecall.rs b/crates/core/executor/src/minimal/ecall.rs
+index f89ac1ba2..bf160e56d 100644
+--- a/crates/core/executor/src/minimal/ecall.rs
++++ b/crates/core/executor/src/minimal/ecall.rs
+@@ -4,6 +4,7 @@ use super::{
+     debug::{delete_profile_symbols_syscall, dump_elf_syscall, insert_profile_symbols_syscall},
+     hint::{hint_len, hint_read},
+     precompiles::{
++        blake3::blake3_compress_inner,
+         edwards::{edwards_add, edwards_decompress_syscall},
+         fptower::{fp2_addsub_syscall, fp2_mul_syscall, fp_op_syscall},
+         keccak::keccak_permute,
+@@ -89,6 +90,7 @@ pub fn ecall_handler(ctx: &mut impl SyscallContext, code: SyscallCode) -> Result
+     match code {
+         SyscallCode::SHA_EXTEND => unsafe { sha256_extend(ctx, arg1, arg2) },
+         SyscallCode::SHA_COMPRESS => unsafe { sha256_compress(ctx, arg1, arg2) },
++        SyscallCode::BLAKE3_COMPRESS_INNER => unsafe { blake3_compress_inner(ctx, arg1, arg2) },
+         SyscallCode::KECCAK_PERMUTE => unsafe { keccak_permute(ctx, arg1, arg2) },
+         SyscallCode::SECP256K1_ADD => unsafe {
+             weierstrass_add_assign_syscall::<Secp256k1>(ctx, arg1, arg2)
+diff --git a/crates/core/executor/src/minimal/precompiles/blake3.rs b/crates/core/executor/src/minimal/precompiles/blake3.rs
+new file mode 100644
+index 000000000..b3d356f51
+--- /dev/null
++++ b/crates/core/executor/src/minimal/precompiles/blake3.rs
+@@ -0,0 +1,86 @@
++use sp1_jit::SyscallContext;
++
++/// Full Blake3 message schedule for 7 rounds (reference: https://github.com/BLAKE3-team/BLAKE3-specs).
++const MSG_SCHEDULE: [[usize; 16]; 7] = [
++    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
++    [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8],
++    [3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1],
++    [10, 12, 13, 14, 6, 3, 4, 11, 0, 7, 9, 2, 8, 5, 1, 15],
++    [6, 5, 9, 8, 2, 10, 13, 0, 4, 3, 7, 14, 11, 1, 12, 15],
++    [2, 3, 4, 14, 6, 5, 7, 11, 10, 8, 9, 1, 13, 12, 0, 15],
++    [12, 8, 9, 5, 11, 6, 14, 0, 2, 3, 7, 4, 13, 10, 1, 15],
++];
++
++/// G_INDEX: for each of the 8 column operations in a round, the 4 state indices.
++const G_INDEX: [[usize; 4]; 8] = [
++    [0, 4, 8, 12],
++    [1, 5, 9, 13],
++    [2, 6, 10, 14],
++    [3, 7, 11, 15],
++    [0, 5, 10, 15],
++    [1, 6, 11, 12],
++    [2, 7, 8, 13],
++    [3, 4, 9, 14],
++];
++
++fn g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
++    state[a] = state[a].wrapping_add(state[b]).wrapping_add(mx);
++    state[d] = (state[d] ^ state[a]).rotate_right(16);
++    state[c] = state[c].wrapping_add(state[d]);
++    state[b] = (state[b] ^ state[c]).rotate_right(12);
++    state[a] = state[a].wrapping_add(state[b]).wrapping_add(my);
++    state[d] = (state[d] ^ state[a]).rotate_right(8);
++    state[c] = state[c].wrapping_add(state[d]);
++    state[b] = (state[b] ^ state[c]).rotate_right(7);
++}
++
++/// The Blake3 inner compress syscall for the minimal executor.
++///
++/// Arguments:
++///   - `arg1` (a0): pointer to 16-word state array (in/out), each word at offset `i * 8`
++///   - `arg2` (a1): pointer to 16-word message array (read-only), each word at offset `j * 8`
++///
++/// # Safety
++/// - The memory in `ctx` is valid for the duration of the function call.
++#[allow(clippy::pedantic)]
++pub(crate) unsafe fn blake3_compress_inner(
++    ctx: &mut impl SyscallContext,
++    arg1: u64,
++    arg2: u64,
++) -> Option<u64> {
++    let state_ptr = arg1;
++    let msg_ptr = arg2;
++
++    // Phase 1: Read the 16 state words.
++    let mut state = [0u32; 16];
++    for i in 0..16 {
++        state[i] = ctx.mr(state_ptr + i as u64 * 8) as u32;
++    }
++
++    ctx.bump_memory_clk();
++
++    // Phase 2: Read the 16 message words.
++    let mut msg = [0u32; 16];
++    for j in 0..16 {
++        msg[j] = ctx.mr(msg_ptr + j as u64 * 8) as u32;
++    }
++
++    ctx.bump_memory_clk();
++
++    // Compute Blake3 compression: 7 rounds of 8 G operations each.
++    for round in 0..7 {
++        for op in 0..8 {
++            let [a, b, c, d] = G_INDEX[op];
++            let mx = msg[MSG_SCHEDULE[round][2 * op]];
++            let my = msg[MSG_SCHEDULE[round][2 * op + 1]];
++            g(&mut state, a, b, c, d, mx, my);
++        }
++    }
++
++    // Phase 3: Write the 16 state output words.
++    for i in 0..16 {
++        ctx.mw(state_ptr + i as u64 * 8, state[i] as u64);
++    }
++
++    None
++}
+diff --git a/crates/core/executor/src/minimal/precompiles/mod.rs b/crates/core/executor/src/minimal/precompiles/mod.rs
+index 62b86bfc7..7777a9a58 100644
+--- a/crates/core/executor/src/minimal/precompiles/mod.rs
++++ b/crates/core/executor/src/minimal/precompiles/mod.rs
+@@ -1,5 +1,6 @@
+ mod ec;
+ 
++pub mod blake3;
+ pub mod edwards;
+ pub mod fptower;
+ pub mod keccak;
+diff --git a/crates/core/executor/src/syscall_code.rs b/crates/core/executor/src/syscall_code.rs
+index c26459782..0b4749a12 100644
+--- a/crates/core/executor/src/syscall_code.rs
++++ b/crates/core/executor/src/syscall_code.rs
+@@ -178,6 +178,9 @@ pub enum SyscallCode {
+     #[allow(clippy::mistyped_literal_suffixes)]
+     SIG_RETURN = 0x00_00_01_34,
+ 
++    /// Executes the `BLAKE3_COMPRESS_INNER` precompile.
++    BLAKE3_COMPRESS_INNER = 0x00_01_01_34,
++
+     /// Executes the `HINT_MPROTECT_FLUSH` syscall.
+     HINT_MPROTECT_FLUSH = 0x00_00_00_35,
+ 
+@@ -242,6 +245,7 @@ impl SyscallCode {
+             0x00_00_01_33 => SyscallCode::POSEIDON2,
+             #[allow(clippy::mistyped_literal_suffixes)]
+             0x00_00_01_34 => SyscallCode::SIG_RETURN,
++            0x00_01_01_34 => SyscallCode::BLAKE3_COMPRESS_INNER,
+             0x00_00_00_35 => SyscallCode::HINT_MPROTECT_FLUSH,
+             0x00_00_00_40 => SyscallCode::DUMP_ELF,
+             0x00_00_00_41 => SyscallCode::INSERT_PROFILER_SYMBOLS,
+@@ -355,6 +359,7 @@ impl SyscallCode {
+             SyscallCode::MPROTECT => RiscvAirId::Mprotect,
+             SyscallCode::POSEIDON2 => RiscvAirId::Poseidon2,
+             SyscallCode::SIG_RETURN => RiscvAirId::SigReturn,
++            SyscallCode::BLAKE3_COMPRESS_INNER => RiscvAirId::Blake3Compress,
+             SyscallCode::HINT_MPROTECT_FLUSH
+             | SyscallCode::DUMP_ELF
+             | SyscallCode::INSERT_PROFILER_SYMBOLS
+@@ -375,6 +380,8 @@ impl SyscallCode {
+         })
+     }
+ 
++    // Note: the next as_air_id_user fn was inserted in v6.2.2 (post the PR's base).
++    // We add BLAKE3_COMPRESS_INNER there too so user-mode dispatch knows about it.
+     /// Get the ID of the AIR used in the syscall implementation in user mode.
+     #[must_use]
+     pub fn as_air_id_user(self) -> Option<RiscvAirId> {
+@@ -413,6 +420,7 @@ impl SyscallCode {
+             SyscallCode::MPROTECT => RiscvAirId::Mprotect,
+             SyscallCode::SIG_RETURN => RiscvAirId::SigReturn,
+             SyscallCode::POSEIDON2 => RiscvAirId::Poseidon2User,
++            SyscallCode::BLAKE3_COMPRESS_INNER => RiscvAirId::Blake3Compress,
+             SyscallCode::HINT_MPROTECT_FLUSH
+             | SyscallCode::DUMP_ELF
+             | SyscallCode::INSERT_PROFILER_SYMBOLS
+@@ -474,6 +482,8 @@ impl SyscallCode {
+             SyscallCode::U256XU2048_MUL => 72,
+             SyscallCode::MPROTECT => 0,
+             SyscallCode::POSEIDON2 => 8,
++            // 16 state reads + 16 msg reads (state writes share same addresses as reads)
++            SyscallCode::BLAKE3_COMPRESS_INNER => 32,
+             _ => 0,
+         }
+     }
+@@ -522,6 +532,8 @@ impl SyscallCode {
+             SyscallCode::U256XU2048_MUL => 4 * 2,
+             SyscallCode::MPROTECT => 1,
+             SyscallCode::POSEIDON2 => 2,
++            // 3 address slices: state_init, msg_read, finalize — each up to 2 pages
++            SyscallCode::BLAKE3_COMPRESS_INNER => 3 * 2,
+             _ => 0,
+         }
+     }
+diff --git a/crates/core/executor/src/vm/syscall.rs b/crates/core/executor/src/vm/syscall.rs
+index ef8f83f2a..e6fc756d2 100644
+--- a/crates/core/executor/src/vm/syscall.rs
++++ b/crates/core/executor/src/vm/syscall.rs
+@@ -401,6 +401,9 @@ pub(crate) fn sp1_ecall_handler<'a, M: ExecutionMode, RT: SyscallRuntime<'a, M>>
+         SyscallCode::MPROTECT => Ok(mprotect::mprotect(rt, code, args1, args2)),
+         SyscallCode::SIG_RETURN => Ok(sig_return::sig_return(rt, code, args1, args2)),
+         SyscallCode::POSEIDON2 => poseidon2::poseidon2(rt, code, args1, args2),
++        SyscallCode::BLAKE3_COMPRESS_INNER => {
++            precompiles::blake3::blake3_compress_inner(rt, code, args1, args2)
++        }
+         SyscallCode::VERIFY_SP1_PROOF
+         | SyscallCode::WRITE
+         | SyscallCode::ENTER_UNCONSTRAINED
+diff --git a/crates/core/executor/src/vm/syscall/precompiles/blake3/mod.rs b/crates/core/executor/src/vm/syscall/precompiles/blake3/mod.rs
+new file mode 100644
+index 000000000..a9e26dcb3
+--- /dev/null
++++ b/crates/core/executor/src/vm/syscall/precompiles/blake3/mod.rs
+@@ -0,0 +1,126 @@
++use crate::{
++    events::{Blake3CompressEvent, PrecompileEvent},
++    vm::syscall::SyscallRuntime,
++    SyscallCode,
++};
++
++/// Full Blake3 message schedule for 7 rounds (reference: https://github.com/BLAKE3-team/BLAKE3-specs).
++const MSG_SCHEDULE: [[usize; 16]; 7] = [
++    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
++    [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8],
++    [3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1],
++    [10, 12, 13, 14, 6, 3, 4, 11, 0, 7, 9, 2, 8, 5, 1, 15],
++    [6, 5, 9, 8, 2, 10, 13, 0, 4, 3, 7, 14, 11, 1, 12, 15],
++    [2, 3, 4, 14, 6, 5, 7, 11, 10, 8, 9, 1, 13, 12, 0, 15],
++    [12, 8, 9, 5, 11, 6, 14, 0, 2, 3, 7, 4, 13, 10, 1, 15],
++];
++
++/// G_INDEX: for each of the 8 column operations in a round, the 4 state indices.
++const G_INDEX: [[usize; 4]; 8] = [
++    [0, 4, 8, 12],
++    [1, 5, 9, 13],
++    [2, 6, 10, 14],
++    [3, 7, 11, 15],
++    [0, 5, 10, 15],
++    [1, 6, 11, 12],
++    [2, 7, 8, 13],
++    [3, 4, 9, 14],
++];
++
++/// Execute the Blake3 G function in-place on state.
++fn g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
++    state[a] = state[a].wrapping_add(state[b]).wrapping_add(mx);
++    state[d] = (state[d] ^ state[a]).rotate_right(16);
++    state[c] = state[c].wrapping_add(state[d]);
++    state[b] = (state[b] ^ state[c]).rotate_right(12);
++    state[a] = state[a].wrapping_add(state[b]).wrapping_add(my);
++    state[d] = (state[d] ^ state[a]).rotate_right(8);
++    state[c] = state[c].wrapping_add(state[d]);
++    state[b] = (state[b] ^ state[c]).rotate_right(7);
++}
++
++/// Executor handler for the Blake3 inner compress syscall.
++///
++/// Arguments:
++///   - `arg1` (a0): pointer to 16-word state array (in/out)
++///   - `arg2` (a1): pointer to 16-word message array (read-only)
++pub(crate) fn blake3_compress_inner<'a, RT: SyscallRuntime<'a>>(
++    rt: &mut RT,
++    syscall_code: SyscallCode,
++    arg1: u64,
++    arg2: u64,
++) -> Option<u64> {
++    let state_ptr = arg1;
++    let msg_ptr = arg2;
++
++    let clk = rt.core().clk();
++
++    // Phase 1: Read the 16 state words.
++    let mut state_in = [0u32; 16];
++    let mut state_read_records = Vec::with_capacity(16);
++    for i in 0..16 {
++        let record = rt.mr(state_ptr + i as u64 * 8);
++        state_in[i] = record.value as u32;
++        state_read_records.push(record);
++    }
++
++    rt.increment_clk();
++
++    // Phase 2: Read the 16 message words.
++    let mut msg = [0u32; 16];
++    let mut msg_read_records = Vec::with_capacity(16);
++    for j in 0..16 {
++        let record = rt.mr(msg_ptr + j as u64 * 8);
++        msg[j] = record.value as u32;
++        msg_read_records.push(record);
++    }
++
++    rt.increment_clk();
++
++    // Compute Blake3 compression.
++    let mut state = state_in;
++    for round in 0..7 {
++        for op in 0..8 {
++            let [a, b, c, d] = G_INDEX[op];
++            let mx = msg[MSG_SCHEDULE[round][2 * op]];
++            let my = msg[MSG_SCHEDULE[round][2 * op + 1]];
++            g(&mut state, a, b, c, d, mx, my);
++        }
++    }
++    let state_out = state;
++
++    // Phase 3: Write the 16 state words.
++    let mut state_write_records = Vec::with_capacity(16);
++    for i in 0..16 {
++        let record = rt.mw(state_ptr + i as u64 * 8);
++        state_write_records.push(record);
++    }
++
++    if RT::TRACING {
++        let event = PrecompileEvent::Blake3CompressInner(Blake3CompressEvent {
++            clk,
++            state_ptr,
++            msg_ptr,
++            state_in,
++            state_out,
++            msg,
++            state_read_records: state_read_records.try_into().unwrap(),
++            msg_read_records: msg_read_records.try_into().unwrap(),
++            state_write_records: state_write_records.try_into().unwrap(),
++            local_mem_access: rt.postprocess_precompile(),
++            ..Default::default()
++        });
++        let syscall_event = rt.syscall_event(
++            clk,
++            syscall_code,
++            arg1,
++            arg2,
++            false,
++            rt.core().next_pc(),
++            rt.core().exit_code(),
++        );
++        rt.add_precompile_event(syscall_code, syscall_event, event);
++    }
++
++    None
++}
+diff --git a/crates/core/executor/src/vm/syscall/precompiles/mod.rs b/crates/core/executor/src/vm/syscall/precompiles/mod.rs
+index 730b86023..3aff211ec 100644
+--- a/crates/core/executor/src/vm/syscall/precompiles/mod.rs
++++ b/crates/core/executor/src/vm/syscall/precompiles/mod.rs
+@@ -1,3 +1,4 @@
++pub mod blake3;
+ pub mod edwards;
+ pub mod fptower;
+ pub mod keccak256;
+diff --git a/crates/core/machine/src/riscv/mod.rs b/crates/core/machine/src/riscv/mod.rs
+index f38026190..129bf26fc 100644
+--- a/crates/core/machine/src/riscv/mod.rs
++++ b/crates/core/machine/src/riscv/mod.rs
+@@ -63,6 +63,7 @@ pub(crate) mod riscv_chips {
+                 keccak256::{KeccakPermuteChip, KeccakPermuteControlChip},
+                 mprotect::MProtectChip,
+                 poseidon2::Poseidon2Chip,
++                blake3::{Blake3CompressChip, Blake3CompressControlChip},
+                 sha256::{
+                     ShaCompressChip, ShaCompressControlChip, ShaExtendChip, ShaExtendControlChip,
+                 },
+@@ -253,6 +254,10 @@ pub enum RiscvAir<F: PrimeField32> {
+     Sha256CompressControl(ShaCompressControlChip<SupervisorMode>),
+     /// A controller for sha256 compress (user mode).
+     Sha256CompressControlUser(ShaCompressControlChip<UserMode>),
++    /// A precompile for blake3 compress.
++    Blake3Compress(Blake3CompressChip),
++    /// A controller for blake3 compress.
++    Blake3CompressControl(Blake3CompressControlChip),
+     /// A precompile for addition on the Elliptic curve ed25519.
+     Ed25519Add(EdAddAssignChip<EdwardsCurve<Ed25519Parameters>, SupervisorMode>),
+     /// A precompile for addition on the Elliptic curve ed25519 (user mode).
+@@ -358,6 +363,8 @@ impl<F: PrimeField32> RiscvAir<F> {
+             RiscvAir::Sha256Compress(ShaCompressChip::default()),
+             RiscvAir::Sha256CompressControl(ShaCompressControlChip::<SupervisorMode>::new()),
+             RiscvAir::Sha256CompressControlUser(ShaCompressControlChip::<UserMode>::new()),
++            RiscvAir::Blake3Compress(Blake3CompressChip::default()),
++            RiscvAir::Blake3CompressControl(Blake3CompressControlChip::default()),
+             RiscvAir::Ed25519Add(
+                 EdAddAssignChip::<EdwardsCurve<Ed25519Parameters>, SupervisorMode>::new(),
+             ),
+@@ -569,6 +576,7 @@ impl<F: PrimeField32> RiscvAir<F> {
+         let precompile_clusters = [
+             [Sha256Extend, Sha256ExtendControl].as_slice(),
+             [Sha256Compress, Sha256CompressControl].as_slice(),
++            [Blake3Compress, Blake3CompressControl].as_slice(),
+             [Ed25519Add].as_slice(),
+             [Ed25519Decompress].as_slice(),
+             [Secp256k1Add].as_slice(),
+@@ -875,6 +883,16 @@ impl<F: PrimeField32> RiscvAir<F> {
+             .insert(sha_compress_control_user.name().to_string(), sha_compress_control_user.cost());
+         chips.push(sha_compress_control_user);
+ 
++        let blake3_compress =
++            Chip::new(RiscvAir::Blake3Compress(Blake3CompressChip::default()));
++        costs.insert(blake3_compress.name().to_string(), blake3_compress.cost());
++        chips.push(blake3_compress);
++
++        let blake3_compress_control =
++            Chip::new(RiscvAir::Blake3CompressControl(Blake3CompressControlChip::default()));
++        costs.insert(blake3_compress_control.name().to_string(), blake3_compress_control.cost());
++        chips.push(blake3_compress_control);
++
+         let ed_add_assign = Chip::new(RiscvAir::Ed25519Add(EdAddAssignChip::<
+             EdwardsCurve<Ed25519Parameters>,
+             SupervisorMode,
+@@ -1707,6 +1725,8 @@ impl From<RiscvAirDiscriminants> for RiscvAirId {
+             RiscvAirDiscriminants::Sha256ExtendControlUser => RiscvAirId::ShaExtendControlUser,
+             RiscvAirDiscriminants::Sha256CompressControl => RiscvAirId::ShaCompressControl,
+             RiscvAirDiscriminants::Sha256CompressControlUser => RiscvAirId::ShaCompressControlUser,
++            RiscvAirDiscriminants::Blake3Compress => RiscvAirId::Blake3Compress,
++            RiscvAirDiscriminants::Blake3CompressControl => RiscvAirId::Blake3CompressControl,
+             RiscvAirDiscriminants::KeccakPControl => RiscvAirId::KeccakPermuteControl,
+             RiscvAirDiscriminants::KeccakPControlUser => RiscvAirId::KeccakPermuteControlUser,
+             RiscvAirDiscriminants::Mprotect => RiscvAirId::Mprotect,
+diff --git a/crates/core/machine/src/syscall/precompiles/blake3/compress/air.rs b/crates/core/machine/src/syscall/precompiles/blake3/compress/air.rs
+new file mode 100644
+index 000000000..c0b2ca0bc
+--- /dev/null
++++ b/crates/core/machine/src/syscall/precompiles/blake3/compress/air.rs
+@@ -0,0 +1,507 @@
++use core::borrow::Borrow;
++use std::iter::once;
++
++use slop_air::{Air, AirBuilder, BaseAir};
++use slop_algebra::AbstractField;
++use slop_matrix::Matrix;
++use sp1_hypercube::{
++    air::{AirInteraction, BaseAirBuilder, InteractionScope},
++    InteractionKind, Word,
++};
++
++use super::{
++    columns::{Blake3CompressCols, NUM_BLAKE3_COMPRESS_COLS},
++    Blake3CompressChip, FINALIZE_START, G_INDEX, MSG_SCHEDULE, OPERATION_COUNT, ROUND_COUNT,
++    STATE_INIT_START,
++};
++use crate::{
++    air::{SP1CoreAirBuilder, WordAirBuilder},
++    operations::{AddrAddOperation, AddU32Operation, FixedRotateRightOperation, XorU32Operation},
++};
++
++impl<F> BaseAir<F> for Blake3CompressChip {
++    fn width(&self) -> usize {
++        NUM_BLAKE3_COMPRESS_COLS
++    }
++}
++
++impl<AB> Air<AB> for Blake3CompressChip
++where
++    AB: SP1CoreAirBuilder,
++{
++    fn eval(&self, builder: &mut AB) {
++        let main = builder.main();
++        let local = main.row_slice(0);
++        let local: &Blake3CompressCols<AB::Var> = (*local).borrow();
++
++        self.eval_flags(builder, local);
++        self.eval_memory(builder, local);
++        self.eval_g_function(builder, local);
++        self.eval_interaction(builder, local);
++    }
++}
++
++impl Blake3CompressChip {
++    /// Constrain phase-selector flags and the index.
++    fn eval_flags<AB: SP1CoreAirBuilder>(
++        &self,
++        builder: &mut AB,
++        local: &Blake3CompressCols<AB::Var>,
++    ) {
++        builder.assert_bool(local.is_real);
++        builder.assert_bool(local.is_state_init);
++        builder.assert_bool(local.is_msg_read);
++        builder.assert_bool(local.is_compute);
++        builder.assert_bool(local.is_finalize);
++
++        // Exactly one phase is active on a real row.
++        builder.when(local.is_real).assert_one(
++            local.is_state_init
++                + local.is_msg_read
++                + local.is_compute
++                + local.is_finalize,
++        );
++
++        // phase_idx is one-hot for init/msg_read/finalize rows.
++        let mut phase_idx_sum = AB::Expr::zero();
++        let mut computed_phase_idx = AB::Expr::zero();
++        for i in 0..16 {
++            builder.assert_bool(local.phase_idx[i]);
++            phase_idx_sum = phase_idx_sum + local.phase_idx[i].into();
++            computed_phase_idx = computed_phase_idx
++                + local.phase_idx[i] * AB::Expr::from_canonical_u32(i as u32);
++        }
++        builder
++            .when(local.is_state_init + local.is_msg_read + local.is_finalize)
++            .assert_one(phase_idx_sum);
++
++        // round is one-hot for compute rows.
++        let mut round_sum = AB::Expr::zero();
++        let mut computed_round = AB::Expr::zero();
++        for r in 0..ROUND_COUNT {
++            builder.assert_bool(local.round[r]);
++            round_sum = round_sum + local.round[r].into();
++            computed_round = computed_round
++                + local.round[r] * AB::Expr::from_canonical_u32(r as u32);
++        }
++        builder.when(local.is_compute).assert_one(round_sum);
++
++        // op is one-hot for compute rows.
++        let mut op_sum = AB::Expr::zero();
++        let mut computed_op = AB::Expr::zero();
++        for o in 0..OPERATION_COUNT {
++            builder.assert_bool(local.op[o]);
++            op_sum = op_sum + local.op[o].into();
++            computed_op = computed_op
++                + local.op[o] * AB::Expr::from_canonical_u32(o as u32);
++        }
++        builder.when(local.is_compute).assert_one(op_sum);
++
++        // On non-compute rows, round and op selectors must be zero.
++        // (This enables using round[r]*op[o] as a degree-2 selector without is_compute.)
++        let non_compute = local.is_state_init + local.is_msg_read + local.is_finalize;
++        for r in 0..ROUND_COUNT {
++            builder.when(non_compute.clone()).assert_zero(local.round[r]);
++        }
++        for o in 0..OPERATION_COUNT {
++            builder.when(non_compute.clone()).assert_zero(local.op[o]);
++        }
++
++        // The row index: index = phase_start + sub_index.
++        let msg_read_start = AB::Expr::from_canonical_u32(16);
++        let compute_start = AB::Expr::from_canonical_u32(32);
++        let finalize_start = AB::Expr::from_canonical_u32(FINALIZE_START as u32);
++
++        let expected_index = local.is_state_init
++            * (AB::Expr::from_canonical_u32(STATE_INIT_START as u32) + computed_phase_idx.clone())
++            + local.is_msg_read * (msg_read_start + computed_phase_idx.clone())
++            + local.is_compute
++                * (compute_start
++                    + computed_round * AB::Expr::from_canonical_u32(OPERATION_COUNT as u32)
++                    + computed_op)
++            + local.is_finalize * (finalize_start + computed_phase_idx);
++        builder.when(local.is_real).assert_eq(local.index, expected_index);
++    }
++
++    /// Constrain memory accesses for state_init, msg_read, and finalize rows.
++    fn eval_memory<AB: SP1CoreAirBuilder>(
++        &self,
++        builder: &mut AB,
++        local: &Blake3CompressCols<AB::Var>,
++    ) {
++        let is_mem_row = local.is_state_init + local.is_msg_read + local.is_finalize;
++
++        let mem_value_word = Word::extend_half::<AB>(&local.mem_value);
++
++        // clk offset: +0 for state_init, +1 for msg_read, +2 for finalize.
++        let clk_offset = local.is_msg_read + local.is_finalize * AB::Expr::from_canonical_u32(2);
++
++        // mem_addr is a witness column (degree 1) holding the effective address for this row.
++        let addr: [AB::Expr; 3] = local.mem_addr.map(Into::into);
++
++        builder.eval_memory_access_write(
++            local.clk_high,
++            local.clk_low.into() + clk_offset,
++            &addr,
++            local.mem,
++            mem_value_word.clone(),
++            is_mem_row.clone(),
++        );
++
++        // Reads: value must not change.
++        builder
++            .when(local.is_state_init + local.is_msg_read)
++            .assert_word_eq(local.mem.prev_value, mem_value_word.clone());
++
++        // Upper two limbs of memory words must be zero (u32 stored in u64 slot).
++        builder.assert_zero(local.mem.prev_value[2]);
++        builder.assert_zero(local.mem.prev_value[3]);
++
++        // Constrain address computations.
++        let phase_idx_expr: AB::Expr = (0..16usize)
++            .map(|i| local.phase_idx[i] * AB::Expr::from_canonical_u32(i as u32))
++            .fold(AB::Expr::zero(), |acc, x| acc + x);
++
++        // state_init: addr = state_ptr + phase_idx * 8
++        AddrAddOperation::<AB::F>::eval(
++            builder,
++            Word([
++                local.state_ptr[0].into(),
++                local.state_ptr[1].into(),
++                local.state_ptr[2].into(),
++                AB::Expr::zero(),
++            ]),
++            Word::extend_expr::<AB>(phase_idx_expr.clone() * AB::Expr::from_canonical_u32(8)),
++            local.mem_addr_state_init,
++            local.is_state_init.into(),
++        );
++        // Bind mem_addr to the computed state_init address.
++        builder.when(local.is_state_init).assert_all_eq(local.mem_addr, local.mem_addr_state_init.value);
++
++        // msg_read: addr = msg_ptr + phase_idx * 8
++        AddrAddOperation::<AB::F>::eval(
++            builder,
++            Word([
++                local.msg_ptr[0].into(),
++                local.msg_ptr[1].into(),
++                local.msg_ptr[2].into(),
++                AB::Expr::zero(),
++            ]),
++            Word::extend_expr::<AB>(phase_idx_expr.clone() * AB::Expr::from_canonical_u32(8)),
++            local.mem_addr_msg_read,
++            local.is_msg_read.into(),
++        );
++        // Bind mem_addr to the computed msg_read address.
++        builder.when(local.is_msg_read).assert_all_eq(local.mem_addr, local.mem_addr_msg_read.value);
++
++        // finalize: addr = state_ptr + phase_idx * 8
++        AddrAddOperation::<AB::F>::eval(
++            builder,
++            Word([
++                local.state_ptr[0].into(),
++                local.state_ptr[1].into(),
++                local.state_ptr[2].into(),
++                AB::Expr::zero(),
++            ]),
++            Word::extend_expr::<AB>(phase_idx_expr * AB::Expr::from_canonical_u32(8)),
++            local.mem_addr_finalize,
++            local.is_finalize.into(),
++        );
++        // Bind mem_addr to the computed finalize address.
++        builder.when(local.is_finalize).assert_all_eq(local.mem_addr, local.mem_addr_finalize.value);
++
++        // State init: mem_value must equal state[phase_idx].
++        let state_picked_lo: AB::Expr = (0..16)
++            .map(|k| local.phase_idx[k] * local.state[k][0])
++            .fold(AB::Expr::zero(), |a, b| a + b);
++        let state_picked_hi: AB::Expr = (0..16)
++            .map(|k| local.phase_idx[k] * local.state[k][1])
++            .fold(AB::Expr::zero(), |a, b| a + b);
++        builder.when(local.is_state_init).assert_eq(local.mem_value[0], state_picked_lo.clone());
++        builder.when(local.is_state_init).assert_eq(local.mem_value[1], state_picked_hi.clone());
++
++        // Msg read: mem_value must equal msg[phase_idx].
++        let msg_picked_lo: AB::Expr = (0..16)
++            .map(|k| local.phase_idx[k] * local.msg[k][0])
++            .fold(AB::Expr::zero(), |a, b| a + b);
++        let msg_picked_hi: AB::Expr = (0..16)
++            .map(|k| local.phase_idx[k] * local.msg[k][1])
++            .fold(AB::Expr::zero(), |a, b| a + b);
++        builder.when(local.is_msg_read).assert_eq(local.mem_value[0], msg_picked_lo);
++        builder.when(local.is_msg_read).assert_eq(local.mem_value[1], msg_picked_hi);
++
++        // Finalize: mem_value must equal state[phase_idx] (writing state out).
++        builder.when(local.is_finalize).assert_eq(local.mem_value[0], state_picked_lo);
++        builder.when(local.is_finalize).assert_eq(local.mem_value[1], state_picked_hi);
++    }
++
++    /// Constrain the G function computation on compute rows.
++    fn eval_g_function<AB: SP1CoreAirBuilder>(
++        &self,
++        builder: &mut AB,
++        local: &Blake3CompressCols<AB::Var>,
++    ) {
++        // Verify that ga, gb, gc, gd match the current state at G_INDEX positions.
++        for o in 0..OPERATION_COUNT {
++            let [ai, bi, ci, di] = G_INDEX[o];
++            builder.when(local.is_compute * local.op[o]).assert_all_eq(
++                local.ga,
++                local.state[ai],
++            );
++            builder.when(local.is_compute * local.op[o]).assert_all_eq(
++                local.gb,
++                local.state[bi],
++            );
++            builder.when(local.is_compute * local.op[o]).assert_all_eq(
++                local.gc,
++                local.state[ci],
++            );
++            builder.when(local.is_compute * local.op[o]).assert_all_eq(
++                local.gd,
++                local.state[di],
++            );
++        }
++
++        // Verify that mx and my match msg at MSG_SCHEDULE indices.
++        // round[r] and op[o] are guaranteed zero on non-compute rows (constrained in eval_flags),
++        // so sel = round[r] * op[o] is a safe degree-2 selector.
++        for r in 0..ROUND_COUNT {
++            for o in 0..OPERATION_COUNT {
++                let mx_idx = MSG_SCHEDULE[r][2 * o];
++                let my_idx = MSG_SCHEDULE[r][2 * o + 1];
++                let sel = local.round[r] * local.op[o];
++                builder.when(sel.clone()).assert_all_eq(local.mx, local.msg[mx_idx]);
++                builder.when(sel).assert_all_eq(local.my, local.msg[my_idx]);
++            }
++        }
++
++        // G function steps:
++        // Step 1: a' = a + b + mx
++        AddU32Operation::<AB::F>::eval(
++            builder,
++            local.ga.map(Into::into),
++            local.gb.map(Into::into),
++            local.a_add_b,
++            local.is_compute.into(),
++        );
++        AddU32Operation::<AB::F>::eval(
++            builder,
++            local.a_add_b.value.map(Into::into),
++            local.mx.map(Into::into),
++            local.a_add_b_add_mx,
++            local.is_compute.into(),
++        );
++
++        // Step 2: d' = d ^ a'
++        let d_xor_a_result = XorU32Operation::<AB::F>::eval_xor_u32(
++            builder,
++            local.gd.map(Into::into),
++            local.a_add_b_add_mx.value.map(Into::into),
++            local.d_xor_a,
++            local.is_compute,
++        );
++
++        // Step 3: d'' = d' rotr 16 — pure limb swap, no extra columns.
++        let d_pp = [d_xor_a_result[1].clone(), d_xor_a_result[0].clone()];
++
++        // Step 4: c' = c + d''
++        AddU32Operation::<AB::F>::eval(
++            builder,
++            local.gc.map(Into::into),
++            d_pp,
++            local.c_add_d,
++            local.is_compute.into(),
++        );
++
++        // Step 5: b' = b ^ c'
++        let _b_xor_c_result = XorU32Operation::<AB::F>::eval_xor_u32(
++            builder,
++            local.gb.map(Into::into),
++            local.c_add_d.value.map(Into::into),
++            local.b_xor_c,
++            local.is_compute,
++        );
++
++        // Constrain b_xor_c_limbs = u16 limbs of b_xor_c.value (bytes → half-words).
++        let base = AB::F::from_canonical_u32(256);
++        builder.when(local.is_compute).assert_eq(
++            local.b_xor_c_limbs[0],
++            Into::<AB::Expr>::into(local.b_xor_c.value[0])
++                + Into::<AB::Expr>::into(local.b_xor_c.value[1]) * base,
++        );
++        builder.when(local.is_compute).assert_eq(
++            local.b_xor_c_limbs[1],
++            Into::<AB::Expr>::into(local.b_xor_c.value[2])
++                + Into::<AB::Expr>::into(local.b_xor_c.value[3]) * base,
++        );
++
++        // Step 6: b'' = b' rotr 12
++        FixedRotateRightOperation::<AB::F>::eval(
++            builder,
++            local.b_xor_c_limbs,
++            12,
++            local.b_rotr12,
++            local.is_compute,
++        );
++
++        // Step 7: a'' = a' + b'' + my
++        AddU32Operation::<AB::F>::eval(
++            builder,
++            local.a_add_b_add_mx.value.map(Into::into),
++            local.b_rotr12.value.map(Into::into),
++            local.a2_add_b2,
++            local.is_compute.into(),
++        );
++        AddU32Operation::<AB::F>::eval(
++            builder,
++            local.a2_add_b2.value.map(Into::into),
++            local.my.map(Into::into),
++            local.a2_add_b2_add_my,
++            local.is_compute.into(),
++        );
++
++        // Step 8: d''' = d'' ^ a''
++        // d'' is the rotr16 of d_xor_a: swap the two u16 limbs.
++        // Re-derive d'' from d_xor_a bytes.
++        let _d_xor_a2_result = XorU32Operation::<AB::F>::eval_xor_u32(
++            builder,
++            [
++                Into::<AB::Expr>::into(local.d_xor_a.value[2])
++                    + Into::<AB::Expr>::into(local.d_xor_a.value[3]) * base,
++                Into::<AB::Expr>::into(local.d_xor_a.value[0])
++                    + Into::<AB::Expr>::into(local.d_xor_a.value[1]) * base,
++            ],
++            local.a2_add_b2_add_my.value.map(Into::into),
++            local.d_xor_a2,
++            local.is_compute,
++        );
++
++        // Constrain d_xor_a2_limbs.
++        builder.when(local.is_compute).assert_eq(
++            local.d_xor_a2_limbs[0],
++            Into::<AB::Expr>::into(local.d_xor_a2.value[0])
++                + Into::<AB::Expr>::into(local.d_xor_a2.value[1]) * base,
++        );
++        builder.when(local.is_compute).assert_eq(
++            local.d_xor_a2_limbs[1],
++            Into::<AB::Expr>::into(local.d_xor_a2.value[2])
++                + Into::<AB::Expr>::into(local.d_xor_a2.value[3]) * base,
++        );
++
++        // Step 9: d'''' = d''' rotr 8
++        FixedRotateRightOperation::<AB::F>::eval(
++            builder,
++            local.d_xor_a2_limbs,
++            8,
++            local.d_rotr8,
++            local.is_compute,
++        );
++
++        // Step 10: c'' = c' + d''''
++        AddU32Operation::<AB::F>::eval(
++            builder,
++            local.c_add_d.value.map(Into::into),
++            local.d_rotr8.value.map(Into::into),
++            local.c_add_d2,
++            local.is_compute.into(),
++        );
++
++        // Step 11: b''' = b'' ^ c''
++        let _b_xor_c2_result = XorU32Operation::<AB::F>::eval_xor_u32(
++            builder,
++            local.b_rotr12.value.map(Into::into),
++            local.c_add_d2.value.map(Into::into),
++            local.b_xor_c2,
++            local.is_compute,
++        );
++
++        // Constrain b_xor_c2_limbs.
++        builder.when(local.is_compute).assert_eq(
++            local.b_xor_c2_limbs[0],
++            Into::<AB::Expr>::into(local.b_xor_c2.value[0])
++                + Into::<AB::Expr>::into(local.b_xor_c2.value[1]) * base,
++        );
++        builder.when(local.is_compute).assert_eq(
++            local.b_xor_c2_limbs[1],
++            Into::<AB::Expr>::into(local.b_xor_c2.value[2])
++                + Into::<AB::Expr>::into(local.b_xor_c2.value[3]) * base,
++        );
++
++        // Step 12: b'''' = b''' rotr 7
++        FixedRotateRightOperation::<AB::F>::eval(
++            builder,
++            local.b_xor_c2_limbs,
++            7,
++            local.b_rotr7,
++            local.is_compute,
++        );
++
++        // Constrain next_state: for each op, bind the 4 updated positions to G outputs
++        // and the 12 unchanged positions to state[k]. Degree-2 constraints (ok here).
++        for o in 0..OPERATION_COUNT {
++            let [ai, bi, ci, di] = G_INDEX[o];
++            let op_sel = local.op[o];
++
++            // Updated positions.
++            builder.when(op_sel).assert_all_eq(local.next_state[ai], local.a2_add_b2_add_my.value);
++            builder.when(op_sel).assert_all_eq(local.next_state[bi], local.b_rotr7.value);
++            builder.when(op_sel).assert_all_eq(local.next_state[ci], local.c_add_d2.value);
++            builder.when(op_sel).assert_all_eq(local.next_state[di], local.d_rotr8.value);
++
++            // Unchanged positions.
++            for k in 0..16 {
++                if k == ai || k == bi || k == ci || k == di {
++                    continue;
++                }
++                builder.when(op_sel).assert_all_eq(local.next_state[k], local.state[k]);
++            }
++        }
++
++        // On non-compute rows, next_state is a passthrough of state.
++        let non_compute = local.is_state_init + local.is_msg_read + local.is_finalize;
++        for k in 0..16 {
++            builder.when(non_compute.clone()).assert_all_eq(local.next_state[k], local.state[k]);
++        }
++    }
++
++    /// Constrain the Blake3Compress interaction (state + msg chaining).
++    fn eval_interaction<AB: SP1CoreAirBuilder>(
++        &self,
++        builder: &mut AB,
++        local: &Blake3CompressCols<AB::Var>,
++    ) {
++        // Receive: the current (state, msg) at index.
++        let receive_values: Vec<AB::Expr> = once(local.clk_high.into())
++            .chain(once(local.clk_low.into()))
++            .chain(local.state_ptr.map(Into::into))
++            .chain(local.msg_ptr.map(Into::into))
++            .chain(once(local.index.into()))
++            .chain(local.state.into_iter().flat_map(|w| w.into_iter()).map(Into::into))
++            .chain(local.msg.into_iter().flat_map(|w| w.into_iter()).map(Into::into))
++            .collect();
++        builder.receive(
++            AirInteraction::new(
++                receive_values,
++                local.is_real.into(),
++                InteractionKind::Blake3Compress,
++            ),
++            InteractionScope::Local,
++        );
++
++        // Send: (clk_h, clk_l, sp, mp, index+1, next_state, msg) with is_real multiplicity.
++        // On compute rows next_state is the post-G state (constrained in eval_g_function).
++        // On non-compute rows next_state == state (passthrough, constrained in eval_g_function).
++        let send_values: Vec<AB::Expr> = once(local.clk_high.into())
++            .chain(once(local.clk_low.into()))
++            .chain(local.state_ptr.map(Into::into))
++            .chain(local.msg_ptr.map(Into::into))
++            .chain(once(local.index.into() + AB::Expr::one()))
++            .chain(local.next_state.into_iter().flat_map(|w| w.into_iter()).map(Into::into))
++            .chain(local.msg.into_iter().flat_map(|w| w.into_iter()).map(Into::into))
++            .collect();
++        builder.send(
++            AirInteraction::new(send_values, local.is_real.into(), InteractionKind::Blake3Compress),
++            InteractionScope::Local,
++        );
++    }
++}
+diff --git a/crates/core/machine/src/syscall/precompiles/blake3/compress/columns.rs b/crates/core/machine/src/syscall/precompiles/blake3/compress/columns.rs
+new file mode 100644
+index 000000000..90e7c628e
+--- /dev/null
++++ b/crates/core/machine/src/syscall/precompiles/blake3/compress/columns.rs
+@@ -0,0 +1,128 @@
++use crate::{
++    memory::MemoryAccessCols,
++    operations::{AddrAddOperation, AddU32Operation, FixedRotateRightOperation, XorU32Operation},
++};
++use sp1_derive::AlignedBorrow;
++use std::mem::size_of;
++
++pub const NUM_BLAKE3_COMPRESS_COLS: usize = size_of::<Blake3CompressCols<u8>>();
++
++/// Columns for the Blake3 compress chip.
++///
++/// Layout (104 rows per invocation):
++///   - Rows   0–15:  state_init  — read state[i] from memory
++///   - Rows  16–31:  msg_read    — read msg[j] from memory
++///   - Rows  32–87:  compute     — one G function call per row (56 rows)
++///   - Rows  88–103: finalize    — write state[i] to memory
++///
++/// The Blake3Compress interaction carries the full 16-word state at each row index,
++/// linking the controller to the first and last rows, and linking successive rows.
++#[derive(AlignedBorrow, Default, Debug, Clone, Copy)]
++#[repr(C)]
++pub struct Blake3CompressCols<T> {
++    // ── Identifiers ─────────────────────────────────────────────────────────
++    /// High 24 bits of the syscall clock.
++    pub clk_high: T,
++    /// Low 24 bits of the syscall clock.
++    pub clk_low: T,
++    /// Pointer to the 16-word state array (three u16 limbs for 48-bit address).
++    pub state_ptr: [T; 3],
++    /// Pointer to the 16-word message array (three u16 limbs for 48-bit address).
++    pub msg_ptr: [T; 3],
++    /// Overall row index within this invocation (0..ROWS_PER_INVOCATION).
++    pub index: T,
++
++    // ── Phase selectors ──────────────────────────────────────────────────────
++    /// True for rows 0–15 (state init).
++    pub is_state_init: T,
++    /// True for rows 16–31 (message read).
++    pub is_msg_read: T,
++    /// True for rows 32–87 (compute / G-function).
++    pub is_compute: T,
++    /// True for rows 88–103 (finalize / state write).
++    pub is_finalize: T,
++
++    /// One-hot selector for position within the 16-element init/finalize phases (0..16).
++    pub phase_idx: [T; 16],
++
++    // ── Compute-phase selectors ──────────────────────────────────────────────
++    /// One-hot selector for the round index (0..7).
++    pub round: [T; 7],
++    /// One-hot selector for the operation index within a round (0..8).
++    pub op: [T; 8],
++
++    // ── State (all rows) ─────────────────────────────────────────────────────
++    /// Full 16-word state, each word stored as two u16 limbs.
++    /// On compute rows, this is the PRE-G-call state.
++    pub state: [[T; 2]; 16],
++    /// Full 16-word state AFTER the G call for this row (compute rows only).
++    /// For non-compute rows, this is unused (zero-initialized).
++    /// Degree-1 witness used in the Blake3Compress interaction send.
++    pub next_state: [[T; 2]; 16],
++
++    // ── Message (msg_read and compute rows) ──────────────────────────────────
++    /// Full 16-word message, each word stored as two u16 limbs.
++    pub msg: [[T; 2]; 16],
++
++    // ── Memory access (init/msg_read/finalize rows, 1 access per row) ────────
++    pub mem: MemoryAccessCols<T>,
++    /// The effective memory address for this row (degree-1 witness for the interaction).
++    /// Bound per-phase: state_init → mem_addr_state_init.value, etc.
++    pub mem_addr: [T; 3],
++    pub mem_addr_state_init: AddrAddOperation<T>,
++    pub mem_addr_msg_read: AddrAddOperation<T>,
++    pub mem_addr_finalize: AddrAddOperation<T>,
++    /// The u32 memory word as two u16 limbs.
++    pub mem_value: [T; 2],
++
++    // ── Active G-function inputs (compute rows) ───────────────────────────────
++    /// state[G_INDEX[op][0]] — first G input
++    pub ga: [T; 2],
++    /// state[G_INDEX[op][1]] — second G input
++    pub gb: [T; 2],
++    /// state[G_INDEX[op][2]] — third G input
++    pub gc: [T; 2],
++    /// state[G_INDEX[op][3]] — fourth G input
++    pub gd: [T; 2],
++    /// msg[MSG_SCHEDULE[round][2*op]] — first message word
++    pub mx: [T; 2],
++    /// msg[MSG_SCHEDULE[round][2*op+1]] — second message word
++    pub my: [T; 2],
++
++    // ── G function intermediate computations (compute rows) ───────────────────
++    //
++    // Step 1: a' = a + b + mx  (two chained adds)
++    pub a_add_b: AddU32Operation<T>,
++    pub a_add_b_add_mx: AddU32Operation<T>,
++    // Step 2: d' = (d ^ a')
++    pub d_xor_a: XorU32Operation<T>,
++    // Step 3: d'' = d' rotr 16  — pure limb swap, no extra columns
++    // Step 4: c' = c + d''
++    pub c_add_d: AddU32Operation<T>,
++    // Step 5: b' = b ^ c'
++    pub b_xor_c: XorU32Operation<T>,
++    /// u16 limbs of b_xor_c result (for rotr12 input — FixedRotateRight needs [T; 2] Vars)
++    pub b_xor_c_limbs: [T; 2],
++    // Step 6: b'' = b' rotr 12
++    pub b_rotr12: FixedRotateRightOperation<T>,
++    // Step 7: a'' = a' + b'' + my  (two chained adds)
++    pub a2_add_b2: AddU32Operation<T>,
++    pub a2_add_b2_add_my: AddU32Operation<T>,
++    // Step 8: d''' = d'' ^ a''
++    pub d_xor_a2: XorU32Operation<T>,
++    /// u16 limbs of d_xor_a2 result (for rotr8 input)
++    pub d_xor_a2_limbs: [T; 2],
++    // Step 9: d'''' = d''' rotr 8
++    pub d_rotr8: FixedRotateRightOperation<T>,
++    // Step 10: c'' = c' + d''''
++    pub c_add_d2: AddU32Operation<T>,
++    // Step 11: b''' = b'' ^ c''
++    pub b_xor_c2: XorU32Operation<T>,
++    /// u16 limbs of b_xor_c2 result (for rotr7 input)
++    pub b_xor_c2_limbs: [T; 2],
++    // Step 12: b'''' = b''' rotr 7
++    pub b_rotr7: FixedRotateRightOperation<T>,
++
++    /// True if this row is a real (non-padding) row.
++    pub is_real: T,
++}
+diff --git a/crates/core/machine/src/syscall/precompiles/blake3/compress/controller.rs b/crates/core/machine/src/syscall/precompiles/blake3/compress/controller.rs
+new file mode 100644
+index 000000000..21cca9ab8
+--- /dev/null
++++ b/crates/core/machine/src/syscall/precompiles/blake3/compress/controller.rs
+@@ -0,0 +1,257 @@
++use core::borrow::Borrow;
++use std::{borrow::BorrowMut, iter::once, mem::MaybeUninit};
++
++use slop_air::{Air, BaseAir};
++use slop_algebra::{AbstractField, PrimeField32};
++use slop_matrix::Matrix;
++use sp1_core_executor::{
++    events::{ByteRecord, PrecompileEvent},
++    ExecutionRecord, Program, SyscallCode,
++};
++use sp1_derive::AlignedBorrow;
++use sp1_hypercube::{
++    air::{AirInteraction, InteractionScope, MachineAir},
++    InteractionKind, Word,
++};
++
++use super::{Blake3CompressControlChip, ROWS_PER_INVOCATION};
++use crate::{
++    air::SP1CoreAirBuilder,
++    operations::{AddrAddOperation, SyscallAddrOperation},
++    utils::{next_multiple_of_32, u32_to_half_word},
++};
++
++pub const NUM_BLAKE3_COMPRESS_CONTROL_COLS: usize =
++    size_of::<Blake3CompressControlCols<u8>>();
++
++/// Last element offset (in units of 8-byte words) for a 16-word array.
++const OFFSET_LAST_ELEM: u64 = 15;
++
++/// Total byte span of a 16-word array in the 64-bit SP1 memory model.
++const ARRAY_BYTE_LEN: u64 = 16 * 8; // = 128
++
++#[derive(AlignedBorrow, Default, Debug, Clone, Copy)]
++#[repr(C)]
++pub struct Blake3CompressControlCols<T> {
++    pub clk_high: T,
++    pub clk_low: T,
++    /// Validated state pointer (16 × 8 bytes = 128 bytes).
++    pub state_ptr: SyscallAddrOperation<T>,
++    /// Validated message pointer (16 × 8 bytes = 128 bytes).
++    pub msg_ptr: SyscallAddrOperation<T>,
++    /// Address of the last state element (for slice validation).
++    pub state_slice_end: AddrAddOperation<T>,
++    /// Address of the last msg element (for slice validation).
++    pub msg_slice_end: AddrAddOperation<T>,
++    pub is_real: T,
++    /// Initial state (state_in): 16 words × 2 u16 limbs.
++    pub initial_state: [[T; 2]; 16],
++    /// Message words: 16 words × 2 u16 limbs.
++    pub msg: [[T; 2]; 16],
++    /// Final state (state_out): 16 words × 2 u16 limbs.
++    pub final_state: [[T; 2]; 16],
++}
++
++impl Blake3CompressControlChip {
++    pub const fn new() -> Self {
++        Self {}
++    }
++}
++
++impl<F> BaseAir<F> for Blake3CompressControlChip {
++    fn width(&self) -> usize {
++        NUM_BLAKE3_COMPRESS_CONTROL_COLS
++    }
++}
++
++impl<F: PrimeField32> MachineAir<F> for Blake3CompressControlChip {
++    type Record = ExecutionRecord;
++    type Program = Program;
++
++    fn name(&self) -> &'static str {
++        "Blake3CompressControl"
++    }
++
++    fn num_rows(&self, input: &Self::Record) -> Option<usize> {
++        let nb_rows =
++            input.get_precompile_events(SyscallCode::BLAKE3_COMPRESS_INNER).len();
++        let size_log2 = input.fixed_log2_rows::<F, _>(self);
++        let padded_nb_rows = next_multiple_of_32(nb_rows, size_log2);
++        Some(padded_nb_rows)
++    }
++
++    fn generate_trace_into(
++        &self,
++        input: &ExecutionRecord,
++        output: &mut ExecutionRecord,
++        buffer: &mut [MaybeUninit<F>],
++    ) {
++        let padded_nb_rows =
++            <Blake3CompressControlChip as MachineAir<F>>::num_rows(self, input).unwrap();
++        let events = input.get_precompile_events(SyscallCode::BLAKE3_COMPRESS_INNER);
++        let num_event_rows = events.len();
++
++        unsafe {
++            let padding_start = num_event_rows * NUM_BLAKE3_COMPRESS_CONTROL_COLS;
++            let padding_size =
++                (padded_nb_rows - num_event_rows) * NUM_BLAKE3_COMPRESS_CONTROL_COLS;
++            if padding_size > 0 {
++                core::ptr::write_bytes(buffer[padding_start..].as_mut_ptr(), 0, padding_size);
++            }
++        }
++
++        let buffer_ptr = buffer.as_mut_ptr() as *mut F;
++        let values = unsafe {
++            core::slice::from_raw_parts_mut(
++                buffer_ptr,
++                num_event_rows * NUM_BLAKE3_COMPRESS_CONTROL_COLS,
++            )
++        };
++
++        let mut blu_events = Vec::new();
++
++        values
++            .chunks_mut(NUM_BLAKE3_COMPRESS_CONTROL_COLS)
++            .enumerate()
++            .for_each(|(idx, row)| {
++                let event = &events[idx].1;
++                let event = if let PrecompileEvent::Blake3CompressInner(event) = event {
++                    event
++                } else {
++                    unreachable!()
++                };
++                let cols: &mut Blake3CompressControlCols<F> = row.borrow_mut();
++                cols.clk_high = F::from_canonical_u32((event.clk >> 24) as u32);
++                cols.clk_low = F::from_canonical_u32((event.clk & 0xFFFFFF) as u32);
++                // state_ptr covers 16 × 8 = 128 bytes.
++                cols.state_ptr.populate(&mut blu_events, event.state_ptr, ARRAY_BYTE_LEN);
++                cols.msg_ptr.populate(&mut blu_events, event.msg_ptr, ARRAY_BYTE_LEN);
++                cols.state_slice_end.populate(
++                    &mut blu_events,
++                    event.state_ptr,
++                    OFFSET_LAST_ELEM * 8,
++                );
++                cols.msg_slice_end.populate(
++                    &mut blu_events,
++                    event.msg_ptr,
++                    OFFSET_LAST_ELEM * 8,
++                );
++                cols.is_real = F::one();
++                for i in 0..16 {
++                    cols.initial_state[i] = u32_to_half_word(event.state_in[i]);
++                    cols.msg[i] = u32_to_half_word(event.msg[i]);
++                    cols.final_state[i] = u32_to_half_word(event.state_out[i]);
++                }
++            });
++
++        output.add_byte_lookup_events(blu_events);
++    }
++
++    fn included(&self, shard: &Self::Record) -> bool {
++        if let Some(shape) = shard.shape.as_ref() {
++            shape.included::<F, _>(self)
++        } else {
++            !shard.get_precompile_events(SyscallCode::BLAKE3_COMPRESS_INNER).is_empty()
++        }
++    }
++}
++
++impl<AB> Air<AB> for Blake3CompressControlChip
++where
++    AB: SP1CoreAirBuilder,
++{
++    fn eval(&self, builder: &mut AB) {
++        let main = builder.main();
++        let local = main.row_slice(0);
++        let local: &Blake3CompressControlCols<AB::Var> = (*local).borrow();
++
++        builder.assert_bool(local.is_real);
++
++        // Validate and extract the two pointers.
++        let state_ptr = SyscallAddrOperation::<AB::F>::eval(
++            builder,
++            ARRAY_BYTE_LEN as u32,
++            local.state_ptr,
++            local.is_real.into(),
++        );
++        let msg_ptr = SyscallAddrOperation::<AB::F>::eval(
++            builder,
++            ARRAY_BYTE_LEN as u32,
++            local.msg_ptr,
++            local.is_real.into(),
++        );
++
++        // Constrain the slice-end address computations.
++        AddrAddOperation::<AB::F>::eval(
++            builder,
++            Word([
++                state_ptr[0].into(),
++                state_ptr[1].into(),
++                state_ptr[2].into(),
++                AB::Expr::zero(),
++            ]),
++            Word::from(OFFSET_LAST_ELEM * 8),
++            local.state_slice_end,
++            local.is_real.into(),
++        );
++        AddrAddOperation::<AB::F>::eval(
++            builder,
++            Word([
++                msg_ptr[0].into(),
++                msg_ptr[1].into(),
++                msg_ptr[2].into(),
++                AB::Expr::zero(),
++            ]),
++            Word::from(OFFSET_LAST_ELEM * 8),
++            local.msg_slice_end,
++            local.is_real.into(),
++        );
++
++        // Receive the syscall.
++        builder.receive_syscall(
++            local.clk_high,
++            local.clk_low,
++            AB::F::from_canonical_u32(SyscallCode::BLAKE3_COMPRESS_INNER.syscall_id()),
++            state_ptr.map(Into::into),
++            msg_ptr.map(Into::into),
++            local.is_real,
++            InteractionScope::Local,
++        );
++
++        // Send the initial (state, msg) at index = 0.
++        let send_values: Vec<AB::Expr> = once(local.clk_high.into())
++            .chain(once(local.clk_low.into()))
++            .chain(state_ptr.map(Into::into))
++            .chain(msg_ptr.map(Into::into))
++            .chain(once(AB::Expr::zero())) // index = 0
++            .chain(
++                local.initial_state.into_iter().flat_map(|w| w.into_iter()).map(Into::into),
++            )
++            .chain(local.msg.into_iter().flat_map(|w| w.into_iter()).map(Into::into))
++            .collect();
++        builder.send(
++            AirInteraction::new(send_values, local.is_real.into(), InteractionKind::Blake3Compress),
++            InteractionScope::Local,
++        );
++
++        // Receive the final (state, msg) at index = ROWS_PER_INVOCATION.
++        let receive_values: Vec<AB::Expr> = once(local.clk_high.into())
++            .chain(once(local.clk_low.into()))
++            .chain(state_ptr.map(Into::into))
++            .chain(msg_ptr.map(Into::into))
++            .chain(once(AB::Expr::from_canonical_u32(ROWS_PER_INVOCATION as u32)))
++            .chain(
++                local.final_state.into_iter().flat_map(|w| w.into_iter()).map(Into::into),
++            )
++            .chain(local.msg.into_iter().flat_map(|w| w.into_iter()).map(Into::into))
++            .collect();
++        builder.receive(
++            AirInteraction::new(
++                receive_values,
++                local.is_real.into(),
++                InteractionKind::Blake3Compress,
++            ),
++            InteractionScope::Local,
++        );
++    }
++}
+diff --git a/crates/core/machine/src/syscall/precompiles/blake3/compress/mod.rs b/crates/core/machine/src/syscall/precompiles/blake3/compress/mod.rs
+new file mode 100644
+index 000000000..eef03c8e3
+--- /dev/null
++++ b/crates/core/machine/src/syscall/precompiles/blake3/compress/mod.rs
+@@ -0,0 +1,166 @@
++mod air;
++pub mod columns;
++mod controller;
++mod trace;
++
++/// Blake3 message schedule permutation.
++pub const MSG_PERMUTATION: [usize; 16] =
++    [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
++
++/// Full Blake3 message schedule for 7 rounds. Each row is a permutation of 0..16.
++///
++/// `MSG_SCHEDULE[r][i]` gives the message word index used at position `i` in round `r`.
++/// For G call (round=r, op=o): mx = msg[MSG_SCHEDULE[r][2*o]], my = msg[MSG_SCHEDULE[r][2*o+1]].
++pub const MSG_SCHEDULE: [[usize; 16]; 7] = [
++    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
++    [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8],
++    [3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1],
++    [10, 12, 13, 14, 6, 3, 4, 11, 0, 7, 9, 2, 8, 5, 1, 15],
++    [6, 5, 9, 8, 2, 10, 13, 0, 4, 3, 7, 14, 11, 1, 12, 15],
++    [2, 3, 4, 14, 6, 5, 7, 11, 10, 8, 9, 1, 13, 12, 0, 15],
++    [12, 8, 9, 5, 11, 6, 14, 0, 2, 3, 7, 4, 13, 10, 1, 15],
++];
++
++/// For each of the 8 operations per round, the 4 state word indices involved.
++pub const G_INDEX: [[usize; 4]; 8] = [
++    [0, 4, 8, 12],
++    [1, 5, 9, 13],
++    [2, 6, 10, 14],
++    [3, 7, 11, 15],
++    [0, 5, 10, 15],
++    [1, 6, 11, 12],
++    [2, 7, 8, 13],
++    [3, 4, 9, 14],
++];
++
++/// Number of rounds in Blake3 compression.
++pub const ROUND_COUNT: usize = 7;
++
++/// Number of G operations per round.
++pub const OPERATION_COUNT: usize = 8;
++
++/// Total number of G calls per compress invocation.
++pub const TOTAL_G_CALLS: usize = ROUND_COUNT * OPERATION_COUNT; // 56
++
++/// Rows for state init phase (reading state from memory).
++pub const STATE_INIT_ROWS: usize = 16;
++
++/// Rows for message read phase (reading message from memory).
++pub const MSG_READ_ROWS: usize = 16;
++
++/// Rows for the compute phase (one row per G call).
++pub const COMPUTE_ROWS: usize = TOTAL_G_CALLS; // 56
++
++/// Rows for the finalize phase (writing state to memory).
++pub const FINALIZE_ROWS: usize = 16;
++
++/// Total rows per Blake3 compress invocation.
++pub const ROWS_PER_INVOCATION: usize =
++    STATE_INIT_ROWS + MSG_READ_ROWS + COMPUTE_ROWS + FINALIZE_ROWS; // 104
++
++/// Row index where the state init phase starts.
++pub const STATE_INIT_START: usize = 0;
++
++/// Row index where the message read phase starts.
++pub const MSG_READ_START: usize = STATE_INIT_START + STATE_INIT_ROWS; // 16
++
++/// Row index where the compute phase starts.
++pub const COMPUTE_START: usize = MSG_READ_START + MSG_READ_ROWS; // 32
++
++/// Row index where the finalize phase starts.
++pub const FINALIZE_START: usize = COMPUTE_START + COMPUTE_ROWS; // 88
++
++/// The Blake3 compress chip, which processes one G-function call per row.
++#[derive(Default)]
++pub struct Blake3CompressChip;
++
++impl Blake3CompressChip {
++    pub const fn new() -> Self {
++        Self {}
++    }
++}
++
++/// The controller chip for Blake3 compress, which receives syscalls and routes them.
++#[derive(Default)]
++pub struct Blake3CompressControlChip;
++
++#[cfg(test)]
++pub mod compress_tests {
++    use std::sync::Arc;
++
++    use sp1_core_executor::Program;
++    use test_artifacts::BLAKE3_COMPRESS_ELF;
++
++    use crate::{
++        io::SP1Stdin,
++        utils::{run_test, setup_logger},
++    };
++
++    use super::{G_INDEX, MSG_SCHEDULE};
++
++    /// Blake3 IV constants.
++    const IV: [u32; 8] = [
++        0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
++        0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
++    ];
++
++    fn g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
++        state[a] = state[a].wrapping_add(state[b]).wrapping_add(mx);
++        state[d] = (state[d] ^ state[a]).rotate_right(16);
++        state[c] = state[c].wrapping_add(state[d]);
++        state[b] = (state[b] ^ state[c]).rotate_right(12);
++        state[a] = state[a].wrapping_add(state[b]).wrapping_add(my);
++        state[d] = (state[d] ^ state[a]).rotate_right(8);
++        state[c] = state[c].wrapping_add(state[d]);
++        state[b] = (state[b] ^ state[c]).rotate_right(7);
++    }
++
++    /// Reference Blake3 compress_inner using the same MSG_SCHEDULE as the machine chip.
++    fn blake3_compress_inner_ref(state: &mut [u32; 16], msg: &[u32; 16]) {
++        for round in 0..7 {
++            for op in 0..8 {
++                let [a, b, c, d] = G_INDEX[op];
++                let mx = msg[MSG_SCHEDULE[round][2 * op]];
++                let my = msg[MSG_SCHEDULE[round][2 * op + 1]];
++                g(state, a, b, c, d, mx, my);
++            }
++        }
++    }
++
++    #[tokio::test]
++    async fn test_blake3_compress_program() {
++        setup_logger();
++        let program = Arc::new(Program::from(&BLAKE3_COMPRESS_ELF).unwrap());
++        let stdin = SP1Stdin::new();
++        let mut public_values = run_test(program, stdin).await.unwrap();
++
++        // Deserialize the committed state from the guest.
++        let proven_state = public_values.read::<[u64; 16]>();
++
++        // Reproduce the same computation natively with the reference implementation.
++        let mut ref_state: [u32; 16] = [
++            IV[0], IV[1], IV[2], IV[3], IV[4], IV[5], IV[6], IV[7],
++            IV[0], IV[1], IV[2], IV[3], 0, 0, 64, 11,
++        ];
++        let msg: [u32; 16] = [
++            0x00010203, 0x04050607, 0x08090a0b, 0x0c0d0e0f,
++            0x10111213, 0x14151617, 0x18191a1b, 0x1c1d1e1f,
++            0x20212223, 0x24252627, 0x28292a2b, 0x2c2d2e2f,
++            0x30313233, 0x34353637, 0x38393a3b, 0x3c3d3e3f,
++        ];
++        for _ in 0..4 {
++            blake3_compress_inner_ref(&mut ref_state, &msg);
++        }
++
++        // The guest stores each u32 word in the lower 32 bits of a u64 slot.
++        for i in 0..16 {
++            assert_eq!(
++                proven_state[i] as u32,
++                ref_state[i],
++                "state[{i}] mismatch: proven={:#010x} expected={:#010x}",
++                proven_state[i] as u32,
++                ref_state[i],
++            );
++        }
++    }
++}
+diff --git a/crates/core/machine/src/syscall/precompiles/blake3/compress/trace.rs b/crates/core/machine/src/syscall/precompiles/blake3/compress/trace.rs
+new file mode 100644
+index 000000000..a39701bc2
+--- /dev/null
++++ b/crates/core/machine/src/syscall/precompiles/blake3/compress/trace.rs
+@@ -0,0 +1,298 @@
++use std::{borrow::BorrowMut, mem::MaybeUninit};
++
++use hashbrown::HashMap;
++use itertools::Itertools;
++use slop_algebra::PrimeField32;
++use slop_maybe_rayon::prelude::{
++    IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut,
++};
++use sp1_core_executor::{
++    events::{Blake3CompressEvent, ByteLookupEvent, ByteRecord, MemoryRecordEnum, PrecompileEvent},
++    ExecutionRecord, Program, SyscallCode,
++};
++use sp1_hypercube::air::MachineAir;
++
++use super::{
++    columns::{Blake3CompressCols, NUM_BLAKE3_COMPRESS_COLS},
++    Blake3CompressChip, COMPUTE_START, FINALIZE_ROWS, FINALIZE_START, G_INDEX,
++    MSG_READ_ROWS, MSG_READ_START, MSG_SCHEDULE, OPERATION_COUNT, ROUND_COUNT, ROWS_PER_INVOCATION,
++    STATE_INIT_ROWS, STATE_INIT_START,
++};
++use crate::utils::{next_multiple_of_32, u32_to_half_word};
++
++impl<F: PrimeField32> MachineAir<F> for Blake3CompressChip {
++    type Record = ExecutionRecord;
++
++    type Program = Program;
++
++    fn name(&self) -> &'static str {
++        "Blake3Compress"
++    }
++
++    fn num_rows(&self, input: &Self::Record) -> Option<usize> {
++        let nb_rows =
++            input.get_precompile_events(SyscallCode::BLAKE3_COMPRESS_INNER).len()
++                * ROWS_PER_INVOCATION;
++        let size_log2 = input.fixed_log2_rows::<F, _>(self);
++        let padded_nb_rows = next_multiple_of_32(nb_rows, size_log2);
++        Some(padded_nb_rows)
++    }
++
++    fn generate_trace_into(
++        &self,
++        input: &ExecutionRecord,
++        _: &mut ExecutionRecord,
++        buffer: &mut [MaybeUninit<F>],
++    ) {
++        let padded_nb_rows =
++            <Blake3CompressChip as MachineAir<F>>::num_rows(self, input).unwrap();
++        let events = input.get_precompile_events(SyscallCode::BLAKE3_COMPRESS_INNER);
++        let num_event_rows = events.len() * ROWS_PER_INVOCATION;
++
++        unsafe {
++            let padding_start = num_event_rows * NUM_BLAKE3_COMPRESS_COLS;
++            let padding_size = (padded_nb_rows - num_event_rows) * NUM_BLAKE3_COMPRESS_COLS;
++            if padding_size > 0 {
++                core::ptr::write_bytes(buffer[padding_start..].as_mut_ptr(), 0, padding_size);
++            }
++        }
++
++        let buffer_ptr = buffer.as_mut_ptr() as *mut F;
++        let values = unsafe {
++            core::slice::from_raw_parts_mut(buffer_ptr, num_event_rows * NUM_BLAKE3_COMPRESS_COLS)
++        };
++
++        let invocation_area = NUM_BLAKE3_COMPRESS_COLS * ROWS_PER_INVOCATION;
++
++        values.par_chunks_mut(invocation_area).enumerate().for_each(|(idx, rows)| {
++            let mut blu = Vec::new();
++            let event = &events[idx].1;
++            let event = if let PrecompileEvent::Blake3CompressInner(event) = event {
++                event
++            } else {
++                unreachable!()
++            };
++            unsafe {
++                core::ptr::write_bytes(rows.as_mut_ptr(), 0, invocation_area);
++            }
++            self.event_to_rows(event, rows, &mut blu);
++        });
++    }
++
++    fn generate_dependencies(&self, input: &Self::Record, output: &mut Self::Record) {
++        let events = input.get_precompile_events(SyscallCode::BLAKE3_COMPRESS_INNER);
++        let chunk_size = std::cmp::max(events.len() / num_cpus::get(), 1);
++
++        let blu_batches = events
++            .par_chunks(chunk_size)
++            .map(|events| {
++                let mut blu: HashMap<ByteLookupEvent, usize> = HashMap::new();
++                let mut rows = vec![F::zero(); NUM_BLAKE3_COMPRESS_COLS * ROWS_PER_INVOCATION];
++                events.iter().for_each(|(_, event)| {
++                    let event = if let PrecompileEvent::Blake3CompressInner(event) = event {
++                        event
++                    } else {
++                        unreachable!()
++                    };
++                    self.event_to_rows::<F>(event, &mut rows, &mut blu);
++                });
++                blu
++            })
++            .collect::<Vec<_>>();
++
++        output.add_byte_lookup_events_from_maps(blu_batches.iter().collect_vec());
++    }
++
++    fn included(&self, shard: &Self::Record) -> bool {
++        if let Some(shape) = shard.shape.as_ref() {
++            shape.included::<F, _>(self)
++        } else {
++            !shard.get_precompile_events(SyscallCode::BLAKE3_COMPRESS_INNER).is_empty()
++        }
++    }
++}
++
++impl Blake3CompressChip {
++    fn event_to_rows<F: PrimeField32>(
++        &self,
++        event: &Blake3CompressEvent,
++        rows: &mut [F],
++        blu: &mut impl ByteRecord,
++    ) {
++        let clk_high = (event.clk >> 24) as u32;
++        let clk_low = (event.clk & 0xFFFFFF) as u32;
++
++        // Convenience: fill common fields for a row.
++        macro_rules! fill_common {
++            ($cols:expr, $row_idx:expr, $state:expr, $msg:expr) => {
++                $cols.clk_high = F::from_canonical_u32(clk_high);
++                $cols.clk_low = F::from_canonical_u32(clk_low);
++                $cols.state_ptr = [
++                    F::from_canonical_u16((event.state_ptr & 0xFFFF) as u16),
++                    F::from_canonical_u16(((event.state_ptr >> 16) & 0xFFFF) as u16),
++                    F::from_canonical_u16(((event.state_ptr >> 32) & 0xFFFF) as u16),
++                ];
++                $cols.msg_ptr = [
++                    F::from_canonical_u16((event.msg_ptr & 0xFFFF) as u16),
++                    F::from_canonical_u16(((event.msg_ptr >> 16) & 0xFFFF) as u16),
++                    F::from_canonical_u16(((event.msg_ptr >> 32) & 0xFFFF) as u16),
++                ];
++                $cols.index = F::from_canonical_u32($row_idx as u32);
++                for _i in 0..16 {
++                    $cols.state[_i] = u32_to_half_word($state[_i]);
++                    $cols.msg[_i] = u32_to_half_word($msg[_i]);
++                }
++            };
++        }
++
++        // ── Phase 1: state_init (rows 0–15) ──────────────────────────────────
++        for i in 0..STATE_INIT_ROWS {
++            let row_idx = STATE_INIT_START + i;
++            let start = row_idx * NUM_BLAKE3_COMPRESS_COLS;
++            let end = (row_idx + 1) * NUM_BLAKE3_COMPRESS_COLS;
++            let cols: &mut Blake3CompressCols<F> = rows[start..end].borrow_mut();
++
++            fill_common!(cols, row_idx, event.state_in, event.msg);
++            cols.is_state_init = F::one();
++            cols.phase_idx[i] = F::one();
++
++            cols.mem_addr_state_init.populate(blu, event.state_ptr, i as u64 * 8);
++            cols.mem_addr = cols.mem_addr_state_init.value;
++            cols.mem.populate(MemoryRecordEnum::Read(event.state_read_records[i]), blu);
++            cols.mem_value = u32_to_half_word(event.state_read_records[i].value as u32);
++
++            // Passthrough: next_state = state (no G function on this row).
++            for k in 0..16 {
++                cols.next_state[k] = cols.state[k];
++            }
++
++            cols.is_real = F::one();
++        }
++
++        // ── Phase 2: msg_read (rows 16–31) ───────────────────────────────────
++        for j in 0..MSG_READ_ROWS {
++            let row_idx = MSG_READ_START + j;
++            let start = row_idx * NUM_BLAKE3_COMPRESS_COLS;
++            let end = (row_idx + 1) * NUM_BLAKE3_COMPRESS_COLS;
++            let cols: &mut Blake3CompressCols<F> = rows[start..end].borrow_mut();
++
++            fill_common!(cols, row_idx, event.state_in, event.msg);
++            cols.is_msg_read = F::one();
++            cols.phase_idx[j] = F::one();
++
++            cols.mem_addr_msg_read.populate(blu, event.msg_ptr, j as u64 * 8);
++            cols.mem_addr = cols.mem_addr_msg_read.value;
++            cols.mem.populate(MemoryRecordEnum::Read(event.msg_read_records[j]), blu);
++            cols.mem_value = u32_to_half_word(event.msg_read_records[j].value as u32);
++
++            // Passthrough: next_state = state (no G function on this row).
++            for k in 0..16 {
++                cols.next_state[k] = cols.state[k];
++            }
++
++            cols.is_real = F::one();
++        }
++
++        // ── Phase 3: compute (rows 32–87, one G call per row) ────────────────
++        let mut current_state = event.state_in;
++
++        for round in 0..ROUND_COUNT {
++            for op in 0..OPERATION_COUNT {
++                let g_call_idx = round * OPERATION_COUNT + op;
++                let row_idx = COMPUTE_START + g_call_idx;
++                let start = row_idx * NUM_BLAKE3_COMPRESS_COLS;
++                let end = (row_idx + 1) * NUM_BLAKE3_COMPRESS_COLS;
++                let cols: &mut Blake3CompressCols<F> = rows[start..end].borrow_mut();
++
++                fill_common!(cols, row_idx, current_state, event.msg);
++                cols.is_compute = F::one();
++                cols.round[round] = F::one();
++                cols.op[op] = F::one();
++
++                let [ai, bi, ci, di] = G_INDEX[op];
++                let mx_val = event.msg[MSG_SCHEDULE[round][2 * op]];
++                let my_val = event.msg[MSG_SCHEDULE[round][2 * op + 1]];
++
++                let a = current_state[ai];
++                let b = current_state[bi];
++                let c = current_state[ci];
++                let d = current_state[di];
++
++                cols.ga = u32_to_half_word(a);
++                cols.gb = u32_to_half_word(b);
++                cols.gc = u32_to_half_word(c);
++                cols.gd = u32_to_half_word(d);
++                cols.mx = u32_to_half_word(mx_val);
++                cols.my = u32_to_half_word(my_val);
++
++                // Step 1: a' = a + b + mx
++                let a_add_b_val = cols.a_add_b.populate(blu, a, b);
++                let a_prime = cols.a_add_b_add_mx.populate(blu, a_add_b_val, mx_val);
++                // Step 2: d' = d ^ a'
++                let d_xor_a_val = cols.d_xor_a.populate_xor_u32(blu, d, a_prime);
++                // Step 3: d'' = d' rotr 16 (pure limb swap)
++                let d_pp = d_xor_a_val.rotate_right(16);
++                // Step 4: c' = c + d''
++                let c_prime = cols.c_add_d.populate(blu, c, d_pp);
++                // Step 5: b' = b ^ c'
++                let b_xor_c_val = cols.b_xor_c.populate_xor_u32(blu, b, c_prime);
++                cols.b_xor_c_limbs = u32_to_half_word(b_xor_c_val);
++                // Step 6: b'' = b' rotr 12
++                let b_pp = cols.b_rotr12.populate(blu, b_xor_c_val, 12);
++                // Step 7: a'' = a' + b'' + my
++                let a2_add_b2_val = cols.a2_add_b2.populate(blu, a_prime, b_pp);
++                let a_pp = cols.a2_add_b2_add_my.populate(blu, a2_add_b2_val, my_val);
++                // Step 8: d''' = d'' ^ a''
++                let d_xor_a2_val = cols.d_xor_a2.populate_xor_u32(blu, d_pp, a_pp);
++                cols.d_xor_a2_limbs = u32_to_half_word(d_xor_a2_val);
++                // Step 9: d'''' = d''' rotr 8
++                let d_4p = cols.d_rotr8.populate(blu, d_xor_a2_val, 8);
++                // Step 10: c'' = c' + d''''
++                let c_pp = cols.c_add_d2.populate(blu, c_prime, d_4p);
++                // Step 11: b''' = b'' ^ c''
++                let b_xor_c2_val = cols.b_xor_c2.populate_xor_u32(blu, b_pp, c_pp);
++                cols.b_xor_c2_limbs = u32_to_half_word(b_xor_c2_val);
++                // Step 12: b'''' = b''' rotr 7
++                let b_4p = cols.b_rotr7.populate(blu, b_xor_c2_val, 7);
++
++                // Update state for next G call.
++                current_state[ai] = a_pp;
++                current_state[bi] = b_4p;
++                current_state[ci] = c_pp;
++                current_state[di] = d_4p;
++
++                // next_state = post-G state for this row's op.
++                // (The unchanged positions keep the pre-G values; cols.state is pre-G.)
++                for k in 0..16 {
++                    cols.next_state[k] = u32_to_half_word(current_state[k]);
++                }
++
++                cols.is_real = F::one();
++            }
++        }
++
++        // ── Phase 4: finalize (rows 88–103) ──────────────────────────────────
++        for i in 0..FINALIZE_ROWS {
++            let row_idx = FINALIZE_START + i;
++            let start = row_idx * NUM_BLAKE3_COMPRESS_COLS;
++            let end = (row_idx + 1) * NUM_BLAKE3_COMPRESS_COLS;
++            let cols: &mut Blake3CompressCols<F> = rows[start..end].borrow_mut();
++
++            fill_common!(cols, row_idx, current_state, event.msg);
++            cols.is_finalize = F::one();
++            cols.phase_idx[i] = F::one();
++
++            cols.mem_addr_finalize.populate(blu, event.state_ptr, i as u64 * 8);
++            cols.mem_addr = cols.mem_addr_finalize.value;
++            cols.mem.populate(MemoryRecordEnum::Write(event.state_write_records[i]), blu);
++            cols.mem_value = u32_to_half_word(event.state_write_records[i].value as u32);
++
++            // Passthrough: next_state = state (no G function on this row).
++            for k in 0..16 {
++                cols.next_state[k] = cols.state[k];
++            }
++
++            cols.is_real = F::one();
++        }
++    }
++}
+diff --git a/crates/core/machine/src/syscall/precompiles/blake3/mod.rs b/crates/core/machine/src/syscall/precompiles/blake3/mod.rs
+new file mode 100644
+index 000000000..847164ea7
+--- /dev/null
++++ b/crates/core/machine/src/syscall/precompiles/blake3/mod.rs
+@@ -0,0 +1,3 @@
++pub mod compress;
++
++pub use compress::{Blake3CompressChip, Blake3CompressControlChip};
+diff --git a/crates/core/machine/src/syscall/precompiles/mod.rs b/crates/core/machine/src/syscall/precompiles/mod.rs
+index d4c380dd4..40ce7dea4 100644
+--- a/crates/core/machine/src/syscall/precompiles/mod.rs
++++ b/crates/core/machine/src/syscall/precompiles/mod.rs
+@@ -1,3 +1,4 @@
++pub mod blake3;
+ pub mod edwards;
+ pub mod fptower;
+ pub mod keccak256;
+diff --git a/crates/hypercube/src/lookup/interaction.rs b/crates/hypercube/src/lookup/interaction.rs
+index 63a110bf8..b65a86ae6 100644
+--- a/crates/hypercube/src/lookup/interaction.rs
++++ b/crates/hypercube/src/lookup/interaction.rs
+@@ -77,6 +77,9 @@ pub enum InteractionKind {
+ 
+     /// Interaction with the `PageProtGlobalFinalize` chip.
+     PageProtGlobalFinalizeControl = 21,
++
++    /// Interaction with the `Blake3Compress` chip.
++    Blake3Compress = 22,
+ }
+ 
+ impl InteractionKind {
+@@ -102,6 +105,7 @@ impl InteractionKind {
+             InteractionKind::PageProtGlobalInitControl,
+             InteractionKind::PageProtGlobalFinalizeControl,
+             InteractionKind::PageProt,
++            InteractionKind::Blake3Compress,
+         ]
+     }
+ 
+@@ -127,6 +131,9 @@ impl InteractionKind {
+             InteractionKind::ShaExtend
+             | InteractionKind::PageProt
+             | InteractionKind::PageProtAccess => 6,
++
++            // clk_high(1) + clk_low(1) + state_ptr(3) + msg_ptr(3) + index(1) + state[16][2](32) + msg[16][2](32) = 73
++            InteractionKind::Blake3Compress => 73,
+             InteractionKind::State
+             | InteractionKind::PageProtGlobalInitControl
+             | InteractionKind::PageProtGlobalFinalizeControl
+@@ -241,6 +248,7 @@ impl Display for InteractionKind {
+             InteractionKind::PageProtGlobalFinalizeControl => {
+                 write!(f, "PageProtGlobalFinalizeControl")
+             }
++            InteractionKind::Blake3Compress => write!(f, "Blake3Compress"),
+         }
+     }
+ }
+diff --git a/crates/test-artifacts/programs/Cargo.lock b/crates/test-artifacts/programs/Cargo.lock
+index b3d014d19..1b08d3038 100644
+--- a/crates/test-artifacts/programs/Cargo.lock
++++ b/crates/test-artifacts/programs/Cargo.lock
+@@ -375,6 +375,13 @@ dependencies = [
+  "cpufeatures",
+ ]
+ 
++[[package]]
++name = "blake3-compress-test"
++version = "1.1.0"
++dependencies = [
++ "sp1-zkvm",
++]
++
+ [[package]]
+ name = "block-buffer"
+ version = "0.9.0"
+diff --git a/crates/test-artifacts/programs/Cargo.toml b/crates/test-artifacts/programs/Cargo.toml
+index dc06ba03c..cc394cc6c 100644
+--- a/crates/test-artifacts/programs/Cargo.toml
++++ b/crates/test-artifacts/programs/Cargo.toml
+@@ -1,6 +1,7 @@
+ [workspace]
+ members = [
+   "common",
++  "blake3-compress",
+   "bls12381-add",
+   "bls12381-decompress",
+   "bls12381-double",
+diff --git a/crates/test-artifacts/programs/blake3-compress/Cargo.toml b/crates/test-artifacts/programs/blake3-compress/Cargo.toml
+new file mode 100644
+index 000000000..214168b61
+--- /dev/null
++++ b/crates/test-artifacts/programs/blake3-compress/Cargo.toml
+@@ -0,0 +1,8 @@
++[package]
++name = "blake3-compress-test"
++version = "1.1.0"
++edition = "2021"
++publish = false
++
++[dependencies]
++sp1-zkvm = { path = "../../../../crates/zkvm/entrypoint" }
+diff --git a/crates/test-artifacts/programs/blake3-compress/src/main.rs b/crates/test-artifacts/programs/blake3-compress/src/main.rs
+new file mode 100644
+index 000000000..cac15d3bf
+--- /dev/null
++++ b/crates/test-artifacts/programs/blake3-compress/src/main.rs
+@@ -0,0 +1,33 @@
++#![no_main]
++sp1_zkvm::entrypoint!(main);
++
++use sp1_zkvm::syscalls::syscall_blake3_compress_inner;
++
++pub fn main() {
++    // Blake3 IV (initialization vector) — first 8 words of the initial state.
++    const IV: [u32; 8] = [
++        0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
++        0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
++    ];
++
++    // Test state: IV followed by counter/flags (simplified).
++    // Each u32 Blake3 word is stored in a u64 slot (upper 32 bits zero).
++    let mut state: [u64; 16] = [
++        IV[0] as u64, IV[1] as u64, IV[2] as u64, IV[3] as u64,
++        IV[4] as u64, IV[5] as u64, IV[6] as u64, IV[7] as u64,
++        IV[0] as u64, IV[1] as u64, IV[2] as u64, IV[3] as u64,
++        0, 0, 64, 11,
++    ];
++    let msg: [u64; 16] = [
++        0x00010203, 0x04050607, 0x08090a0b, 0x0c0d0e0f,
++        0x10111213, 0x14151617, 0x18191a1b, 0x1c1d1e1f,
++        0x20212223, 0x24252627, 0x28292a2b, 0x2c2d2e2f,
++        0x30313233, 0x34353637, 0x38393a3b, 0x3c3d3e3f,
++    ];
++
++    for _ in 0..4 {
++        unsafe { syscall_blake3_compress_inner(state.as_mut_ptr(), msg.as_ptr()); }
++    }
++
++    sp1_zkvm::io::commit(&state);
++}
+diff --git a/crates/test-artifacts/src/lib.rs b/crates/test-artifacts/src/lib.rs
+index f3c124905..58477cd64 100644
+--- a/crates/test-artifacts/src/lib.rs
++++ b/crates/test-artifacts/src/lib.rs
+@@ -12,6 +12,8 @@ pub const FIBONACCI_ELF: Elf = include_elf!("fibonacci-program-tests");
+ 
+ pub const FIBONACCI_BLAKE3_ELF: Elf = include_elf!("fibonacci-blake3-test");
+ 
++pub const BLAKE3_COMPRESS_ELF: Elf = include_elf!("blake3-compress-test");
++
+ pub const HELLO_WORLD_ELF: Elf = include_elf!("hello-world-program");
+ 
+ pub const ED25519_ELF: Elf = include_elf!("ed25519-program");
+diff --git a/crates/zkvm/entrypoint/src/syscalls/blake3_compress.rs b/crates/zkvm/entrypoint/src/syscalls/blake3_compress.rs
+new file mode 100644
+index 000000000..6c6112e6a
+--- /dev/null
++++ b/crates/zkvm/entrypoint/src/syscalls/blake3_compress.rs
+@@ -0,0 +1,23 @@
++#[cfg(target_os = "zkvm")]
++use core::arch::asm;
++
++/// Executes the Blake3 inner compression function on the given state and message.
++///
++/// ### Safety
++///
++/// The caller must ensure that `state` is a valid pointer to a 16-element u64 array and
++/// `msg` is a valid pointer to a 16-element u64 array, both aligned on an eight-byte boundary.
++/// Each u64 element holds a single u32 Blake3 word in its lower 32 bits (upper 32 bits zero).
++#[allow(unused_variables)]
++#[no_mangle]
++pub extern "C" fn syscall_blake3_compress_inner(state: *mut u64, msg: *const u64) {
++    #[cfg(target_os = "zkvm")]
++    unsafe {
++        asm!(
++            "ecall",
++            in("t0") crate::syscalls::BLAKE3_COMPRESS_INNER,
++            in("a0") state,
++            in("a1") msg,
++        );
++    }
++}
+diff --git a/crates/zkvm/entrypoint/src/syscalls/mod.rs b/crates/zkvm/entrypoint/src/syscalls/mod.rs
+index 27177dfe6..635d41aa0 100644
+--- a/crates/zkvm/entrypoint/src/syscalls/mod.rs
++++ b/crates/zkvm/entrypoint/src/syscalls/mod.rs
+@@ -1,4 +1,5 @@
+ mod bigint;
++mod blake3_compress;
+ mod bls12381;
+ mod bn254;
+ mod debug;
+@@ -24,6 +25,7 @@ mod unconstrained;
+ mod verify;
+ 
+ pub use bigint::*;
++pub use blake3_compress::*;
+ pub use bls12381::*;
+ pub use bn254::*;
+ pub use debug::*;
+@@ -188,6 +190,9 @@ pub const POSEIDON2: u32 = 0x00_00_01_33;
+ #[allow(clippy::mistyped_literal_suffixes)]
+ pub const SIG_RETURN: u32 = 0x00_00_01_34;
+ 
++/// Executes the `BLAKE3_COMPRESS_INNER` precompile.
++pub const BLAKE3_COMPRESS_INNER: u32 = 0x00_01_01_34;
++
+ /// Executes the `HINT_MPROTECT_FLUSH` syscall.
+ pub const HINT_MPROTECT_FLUSH: u32 = 0x00_00_00_35;
+ 
+-- 
+2.51.2
+

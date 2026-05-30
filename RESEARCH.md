@@ -273,39 +273,101 @@ reinforces the `PROPOSAL.md` recommendation to avoid SHA3 as the binding hash �
 keccak is structurally penalized in RISC Zero's prover, less so in SP1's, but
 still bad relative to SHA-256 in both.
 
-### BLAKE3 precompile (SP1 PR #2615)
+### BLAKE3 precompile (SP1 PR #2615) — ported forward and measured
 
 [PR #2615][s2615] adds a single syscall `syscall_blake3_compress_inner` (id
-`0x00_01_01_34`) exposing the 7-round Blake3 compression function. It has been
-open since 2026-02, currently `OPEN + CONFLICTING` against the `dev` branch,
-last touched 2026-02. There is no patched `blake3` crate that automatically
-dispatches to it — the PR's own test program calls the syscall directly with a
-fixed 16-word state. Wiring it into a real BLAKE3-of-file guest would require
-writing a BLAKE3 chunker/tree-mode wrapper that swaps in the precompile for the
-inner compression.
+`0x00_01_01_34`) exposing the 7-round Blake3 compression function. It targets
+the `dev` branch and is `OPEN + CONFLICTING` against main; last touched
+2026-02. There is no patched `blake3` crate that auto-dispatches to it.
 
-Status: not benchmarked in this run. To actually exercise it, we'd need to
-build cargo-prove + the entire SP1 stack from `swapnilraj/sp1@5015f02` (the PR's
-workspace is at SP1 v6.0.1 vs. our installed v6.2.2 — installed `cargo-prove`
-won't recognize the syscall code without an executor rebuild). The
-`programs/precompiles-lib` workaround from Finding 1 illustrates the size of
-the task: a usable BLAKE3 wrapper would be ~200 lines (chunk loop, CV stack,
-tree finalize) plus the syscall calls. Tractable but not done here.
+**What was done.** Cherry-picked the four PR commits onto v6.2.2 main. Forward
+ported to the v6.2.2 `SyscallContext` / `SyscallRuntime` API (the per-word
+`mr`/`mw` accessors were replaced with slice helpers, permission checks moved
+into `trap_*` helpers, `postprocess_precompile()` now returns a tuple, the
+`SyscallRuntime` trait gained an `M: ExecutionMode` generic). The controller
+chip's `receive_syscall(...)` gained a `trap_code` arg in v6.2.2 which we pass
+as zero — see "Soundness caveat" below. Wrote a ~150-line BLAKE3 wrapper that
+chunks input into 1024-byte chunks, maintains a CV stack for tree merging,
+calls the precompile per 64-byte block (with the post-compress final XOR
+`state[i] ^= state[i+8]`, `state[i+8] ^= cv_in[i]`), and applies the ROOT flag
+on the final compress. Verified bit-for-bit against the `blake3` crate on the
+host for 1 KiB / 10 KiB / 100 KiB inputs.
 
-**Architectural parity reminder.** RISC Zero v1.2+ supports
-*application-defined precompiles* (PROPOSAL.md § "Application-Defined BLAKE3
-Precompile"). Any speedup the SP1 PR demonstrates is replicable on RISC Zero
-with the same engineering investment. The PR is interesting as a
-free-once-merged data point, not as a permanent architectural advantage.
+Patches included in this branch under `sp1-pr2615-patches/`.
 
-**Expected impact.** At 10 KiB the BLAKE3 region is 271K (RZ) / 264K (SP1)
-cycles, vs ~12K for SHA-256 with precompile — BLAKE3 dominates the hash work by
-~20x. The PR-described chip uses 104 rows per `compress_inner` invocation. At
-10 KiB that's roughly 160 compress calls → ~16K precompile rows vs ~270K rv32im
-rows today — roughly 17x less proving work for the BLAKE3 portion if precompile
-proving cost is comparable per row to rv32im (it generally is or better, since
-the chip is specialized). Plausible: BLAKE3 stops being the bottleneck in the
-binding proof; SHA-256 becomes the next-largest contributor.
+#### Results (CPU prover, Ryzen 5800X, native Linux)
+
+| Size    | SP1 (no BLAKE3 PC)              | SP1 + PR2615 BLAKE3 PC          | cycle ratio | prove ratio |
+|---------|---------------------------------|----------------------------------|------------:|------------:|
+| 1 KiB   | 43,255 cycles, prove 23.71s     | 21,954 cycles, prove 26.58s      |        0.51x |       1.12x |
+| 10 KiB  | 340,848 cycles, prove 27.91s    | 111,232 cycles, prove 28.65s     |        0.33x |       1.03x |
+| 100 KiB | 3,318,498 cycles, prove 73.03s  | 995,732 cycles, prove 63.19s     |        0.30x |       0.87x |
+
+Per-byte for the BLAKE3 region (10 KiB):
+
+| Mode                                | BLAKE3 c/B | SHA-256 c/B |
+|-------------------------------------|-----------:|------------:|
+| RISC Zero (no BLAKE3 PC)            | 26.5       | 1.2         |
+| SP1 (no BLAKE3 PC)                  | 25.8       | 6.5         |
+| **SP1 + PR2615**                    | **3.2**    | 6.5         |
+
+#### Headline findings
+
+1. **The intuition was right: BLAKE3 with PR2615 is cheaper per byte than
+   SHA-256 with its precompile.** 3.2 vs 6.5 cycles/byte at 10 KiB. The
+   BLAKE3 compress chip uses 104 rows per invocation vs SHA-256's ~144 (extend
+   + compress combined), and BLAKE3 fits one syscall per 64-byte block vs
+   SHA-256's two (extend + compress). Both effects compound. With the
+   precompile lit up, the hash region of the binding proof rebalances —
+   **SHA-256 becomes the larger contributor**, not BLAKE3.
+
+2. **Cycle counts collapse but proving wall-clock barely moves at small sizes.**
+   At 1-10 KiB, SP1's fixed proving overhead (~25-28s of Hypercube setup +
+   lookup-table scaffolding) swamps everything. The precompile cuts BLAKE3
+   region cycles by ~8x but proving time is essentially unchanged at small
+   sizes — the rv32im trace was never the bottleneck there.
+
+3. **Scaling story: the precompile pays off at size, but less than the cycle
+   numbers suggest.** At 100 KiB total cycles drop 3.3x (3.3M → 996K) but
+   proving wall-clock only drops 13% (73s → 63s). The proving cost has large
+   fixed components (lookup-table generation, recursion, gnark conversion, the
+   `setup` phase) that don't scale with cycle count, and the BLAKE3 chip's
+   rows-per-byte (~1.6) replaces rv32im rows roughly 1:15 by count, but the
+   BLAKE3 chip rows likely cost more than rv32im rows individually so the net
+   shard-proving improvement is modest. Comparison to RISC Zero at 100 KiB: RZ
+   is 340s, SP1 unaccelerated is 73s, SP1 with BLAKE3 PC is 63s. The RZ→SP1
+   wall-clock gap (5.4x) widened to RZ→SP1+PR2615 (5.4x → still ~5.4x). The
+   precompile makes SP1 *more efficient in cycles* but not dramatically *more
+   efficient in proving time at this size*. The gap may widen further at
+   larger sizes where rv32im dominates more.
+
+4. **Hashes verify correct.** All cycle-count savings are real — the journal
+   hashes match `blake3::hash()` byte for byte across all sizes tested.
+
+#### Soundness caveat (worth re-reading the intuition section above)
+
+The chip integration we shipped here has **known under-constraint** in three
+specific places that are fine for benchmark numbers but not OK to ship to a
+verifier accepting untrusted proofs:
+
+- `receive_syscall(..., trap_code: AB::Expr::zero(), ...)` in the BLAKE3
+  controller. v6.2.2's other precompile controllers thread a real `trap_code`
+  through `AddressSlicePageProtOperation::eval` and propagate it to
+  `is_not_trap`. Our port passes zero unconditionally — a trap on a BLAKE3
+  call would not be caught by the chip.
+- The BLAKE3 controller is not generic over `SupervisorMode`/`UserMode`. The
+  v6.2.2 SHA-256 / Keccak controllers have separate `<SupervisorMode>` and
+  `<UserMode>` variants with different page-prot eval paths. Our BLAKE3 chip
+  effectively only supports trusted (supervisor) mode.
+- The PR's chip predates the page-prot interaction architecture in v6.2.2 and
+  doesn't emit the lookups the new prover expects on those buses.
+
+The runtime path produces correct outputs (the hash always matches the
+`blake3` crate). What's missing is the cryptographic constraint that the
+prover *could not have produced a different output*. For benchmark
+characterization — "how fast does the prover go when everything works" —
+this is fine. For deployment, this chip needs an audit and the chip needs to
+be properly mode-split and trap-aware.
 
 [s2615]: https://github.com/succinctlabs/sp1/pull/2615
 

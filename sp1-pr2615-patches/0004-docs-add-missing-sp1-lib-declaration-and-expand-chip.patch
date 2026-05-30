@@ -1,0 +1,76 @@
+From b25b3ea0aca161056daf4b0b78478ea8a26fdbd9 Mon Sep 17 00:00:00 2001
+From: Swapnil Raj <raj.swapnil99@gmail.com>
+Date: Sun, 22 Feb 2026 17:47:43 +0000
+Subject: docs: add missing sp1-lib declaration and expand chip doc comments
+
+- Add syscall_blake3_compress_inner to sp1-lib extern block so guest
+  programs can call it without depending on sp1-zkvm-entrypoint directly
+- Expand Blake3CompressChip and Blake3CompressControlChip doc comments
+  to describe the AIR row layout and chip responsibilities, matching the
+  level of detail in ShaCompressChip
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ .../precompiles/blake3/compress/mod.rs        | 20 +++++++++++++++++--
+ crates/zkvm/lib/src/lib.rs                    |  7 +++++++
+ 2 files changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/crates/core/machine/src/syscall/precompiles/blake3/compress/mod.rs b/crates/core/machine/src/syscall/precompiles/blake3/compress/mod.rs
+index b7e4a8524..0fa020201 100644
+--- a/crates/core/machine/src/syscall/precompiles/blake3/compress/mod.rs
++++ b/crates/core/machine/src/syscall/precompiles/blake3/compress/mod.rs
+@@ -70,7 +70,19 @@ pub const COMPUTE_START: usize = MSG_READ_START + MSG_READ_ROWS; // 32
+ /// Row index where the finalize phase starts.
+ pub const FINALIZE_START: usize = COMPUTE_START + COMPUTE_ROWS; // 88
+ 
+-/// The Blake3 compress chip, which processes one G-function call per row.
++/// Implements the Blake3 `compress_inner` operation.
++///
++/// The syscall takes a pointer to a 16-word state array and a pointer to a 16-word message array.
++/// The state is updated in-place with the result of 7 rounds of 8 G-function calls each (56 total).
++///
++/// In the AIR, each Blake3 compress syscall occupies [`ROWS_PER_INVOCATION`] = 104 rows:
++/// - Rows   0–15:  state init — read `state[0..16]` from memory
++/// - Rows  16–31:  message read — read `msg[0..16]` from memory
++/// - Rows  32–87:  compute — one G-function call per row (56 rows across 7 rounds × 8 ops)
++/// - Rows  88–103: finalize — write the post-compression `state[0..16]` back to memory
++///
++/// Each memory word is a u32 stored in a u64 slot (upper 32 bits zero), represented in the AIR
++/// as two u16 half-words.
+ #[derive(Default)]
+ pub struct Blake3CompressChip;
+ 
+@@ -80,7 +92,11 @@ impl Blake3CompressChip {
+     }
+ }
+ 
+-/// The controller chip for Blake3 compress, which receives syscalls and routes them.
++/// Controller chip for the Blake3 compress precompile.
++///
++/// Receives the `BLAKE3_COMPRESS_INNER` syscall from the CPU, validates the two memory pointers,
++/// and sends/receives the initial and final states on the [`InteractionKind::Blake3Compress`] bus
++/// to be consumed by [`Blake3CompressChip`].
+ #[derive(Default)]
+ pub struct Blake3CompressControlChip;
+ 
+diff --git a/crates/zkvm/lib/src/lib.rs b/crates/zkvm/lib/src/lib.rs
+index 6bc352aa2..b88e0c959 100644
+--- a/crates/zkvm/lib/src/lib.rs
++++ b/crates/zkvm/lib/src/lib.rs
+@@ -90,6 +90,13 @@ extern "C" {
+     /// Executes the SHA-256 compress operation on the given word array and a given state.
+     pub fn syscall_sha256_compress(w: *mut [u64; 64], state: *mut [u64; 8]);
+ 
++    /// Executes the Blake3 inner compression function.
++    ///
++    /// `state` is a pointer to 16 u64 slots holding the pre-compression state words (u32 each,
++    /// upper 32 bits zero). It is updated in-place with the post-compression state.
++    /// `msg` is a pointer to 16 u64 slots holding the message words (read-only).
++    pub fn syscall_blake3_compress_inner(state: *mut u64, msg: *const u64);
++
+     /// Executes an Ed25519 curve addition on the given points.
+     pub fn syscall_ed_add(p: *mut [u64; 8], q: *const [u64; 8]);
+ 
+-- 
+2.51.2
+

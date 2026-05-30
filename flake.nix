@@ -40,6 +40,10 @@
             curl
             gcc
             protobuf
+            # SP1 from-source builds (cargo-prove etc.) pull in bindgen for the
+            # gnark Go FFI, which needs libclang.
+            llvmPackages.libclang
+            go
           ];
           shellHook = ''
             export PATH="$HOME/.sp1/bin:$PATH"
@@ -48,6 +52,7 @@
             export PATH="$CARGO_HOME/bin:$PATH"
             # nix-ld lets glibc-linked binaries (sp1up's cargo-prove) run.
             export NIX_LD="''${NIX_LD:-/run/current-system/sw/share/nix-ld/lib/ld.so}"
+            export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
           '';
         };
       }
