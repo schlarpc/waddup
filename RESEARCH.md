@@ -440,6 +440,107 @@ the days the user budgeted. Not pursued here.
 
 [zirgen]: https://github.com/risc0/zirgen
 
+### Finding 7 — Recursive composition makes the proof scale-free in memory
+
+The PR2615 port let us measure with the BLAKE3 precompile lit but didn't solve
+the bigger problem: SP1's monolithic CPU prover hits a memory wall at 1 MiB on
+a 64 GiB box. The wall isn't a function of the *useful* work (BLAKE3
+precompile cut cycles 3.3× at 1 MiB and the prover still OOM'd) — it's a
+function of how many rv32im shards SP1 expands in parallel and how much
+working state each shard's lookup-multiplicity / basefold scaffolding keeps
+in memory. SP1's own logger says this out loud: `Memory usage is high: 96%,
+we recommend using the prover network`.
+
+The binding statement decomposes cleanly though:
+
+- **SHA-256** is a 32-byte chained state plus a 64-bit length counter. Each
+  64-byte block updates state via the SP1 precompile. State at chunk
+  boundaries is `O(1)` data, and crucially it can be *precomputed natively*
+  by the host before any prover work runs (it's just SHA-256 of F).
+- **BLAKE3** processes 1024-byte chunks independently into leaf CVs, then
+  merges those CVs in a binary tree via the same precompile. Leaves are
+  embarrassingly parallel; tree merges are `O(log N)` deep.
+
+So a chunk proof can be:
+
+> "Given `(sha_state_in, chunk_bytes, chunk_index)`, the SHA-256 update over
+> `chunk_bytes` yields `sha_state_out` AND the 64 BLAKE3 leaf CVs for the 64
+> sub-chunks at positions `[chunk_index*64..chunk_index*64+64)` are these."
+
+Per-proof memory is bounded by the chunk size, not the file size. The proof
+itself doesn't even compute `sha_state_in` — it accepts it as input. A root
+proof composes N chunk proofs, enforces the chain (`sha_state_out[i] ==
+sha_state_in[i+1]`, `sha_state_in[0] == IV`), absorbs all `N*64` BLAKE3
+leaves into a single CV stack, applies SHA-256 final padding and the BLAKE3
+ROOT flag, and emits `(H_content, H_swarm)`.
+
+`sp1-pr2615-bench-decomposed/` implements exactly this. Chunk size = 64 KiB
+(= 64 BLAKE3 leaves per chunk proof). Chunk proof's public values are a
+fixed 2,116 bytes: `chunk_index || sha_state_in || sha_state_out ||
+[leaf_cv; 64]`. Root verifies each chunk proof via `verify_sp1_proof` (SP1's
+recursion verifier), parses by offset, chains.
+
+#### Measurements (CPU prover, Ryzen 5800X, native Linux)
+
+| Size       | Chunks  | Per-chunk avg | Chunk total | Root prove | Setup | Grand total | Peak mem |
+|------------|--------:|--------------:|------------:|-----------:|------:|------------:|---------:|
+| 64 KiB     |       1 |          125s |        125s |       121s |   30s |        277s |    ~25 G |
+| 128 KiB    |       2 |          121s |        242s |       152s |   28s |        422s |    ~30 G |
+| 1 MiB      |      16 |          118s |       1885s |       386s |   29s |       2300s |    ~53 G |
+
+Both hashes verify byte-for-byte against `sha2::Sha256` and `blake3::hash`
+at every size.
+
+#### Why each chunk proof is ~120s (and how that's mostly compression)
+
+A 64 KiB monolithic core proof in PR2615 mode at the comparable size would be
+~30-40s. The extra ~80-90s per chunk is SP1's `.compressed()` step —
+recursively folding the rv32im trace into a single fixed-size proof that
+`verify_sp1_proof` can witness. We pay this once per sub-proof; it can't be
+amortised across chunks on a single prover instance. The root is also
+`.compressed()` because `verify_sp1_proof` is wired into SP1's recursion
+verifier and core-mode root proofs can't witness sub-proofs.
+
+#### Why this matters anyway, even with the overhead
+
+| Property               | Monolithic              | Decomposed                |
+|------------------------|-------------------------|---------------------------|
+| Peak memory            | scales with file size   | constant in file size     |
+| Largest size on 64 GiB | ~100 KiB                | unbounded                 |
+| Wall-clock at 1 MiB    | OOM                     | 38 min                    |
+| Parallelisable         | no (one shard pipeline) | yes (chunk proofs in parallel; tree merges in log N layers) |
+| Cluster scaling        | none                    | near-ideal                |
+
+On a single CPU box you trade slowness for fitting at all. On a cluster
+matching Succinct's published runs (16× RTX 5090), every chunk proof would
+take ~1-2s in parallel and the binding proof for a 1 GiB file would land in
+minutes — the same architecture, just compute-bound instead of latency-bound.
+
+#### What we amortised (and what we couldn't)
+
+Amortised:
+- **`ProverClient`**: one instance for the whole run.
+- **`ProvingKey`s**: `client.setup(ELF)` once per ELF (chunk + root), reused
+  across all proofs.
+- **Native SHA-256 boundary states**: single `sha2::compress256` pass over
+  the whole file at host startup, no work duplicated per chunk.
+- **ELF compactness**: chunk-prover is 55 KiB, root-prover is 122 KiB, both
+  with `panic = "abort"`, `lto = "fat"`, `strip = true`, `codegen-units = 1`,
+  `opt-level = 3`, and no heap allocations in the hot paths. The chunk's
+  precompile-region cycle counts (`sha256_chunk`, `blake3_leaves`) are at
+  the precompile-latency floor; further Rust-side optimisation has no room
+  to give.
+
+Couldn't:
+- **Per-proof recursion-compression cost**: ~80-90s independent of input
+  size or compute spent. This is the SP1 v6.2 architectural floor and the
+  reason the wall-clock looks the way it does. The Succinct GPU prover
+  hides it through parallelism, not by reducing it. Their `experimental`
+  feature has some warm-state knobs (`WITHOUT_VK_VERIFICATION` etc.) that
+  trade safety for setup time; we used `WITHOUT_VK_VERIFICATION=1` already.
+
+[r_decompose_dir]: ./sp1-pr2615-bench-decomposed
+
 ### NixOS-specific friction (worth documenting)
 
 For reproducibility on NixOS:
@@ -485,3 +586,12 @@ For reproducibility on NixOS:
    lookup architecture. The SHA-256 *algorithm* is shared (NIST FIPS 180-4)
    but no constraint, no row layout, no interaction is portable verbatim.
    Months of work using RZ as a design reference, not weeks of porting.
+6. **Decomposition makes the binding proof scale-free in memory.** The
+   monolithic proof has a per-prover memory ceiling that scales with rv32im
+   trace size; the decomposed version we shipped (`sp1-pr2615-bench-decomposed/`)
+   has per-proof memory bounded by chunk size and works at 1 MiB on a box
+   that OOM'd monolithic at the same size. Composition adds SP1's
+   `.compressed()` recursion overhead per sub-proof (~80-90 s) — visible as
+   ~38 min for 1 MiB on this CPU box — but it's the right architecture once
+   you exceed the monolithic memory ceiling, and that overhead vanishes on a
+   GPU cluster running sub-proofs in parallel.

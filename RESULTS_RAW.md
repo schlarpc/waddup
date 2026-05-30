@@ -551,3 +551,189 @@ waddup SP1 BLAKE3-precompile bench (PR #2615 ported to v6.2.2)
   Proving time:        63.194825302s
   Verification time:   130.242468ms
 
+
+# 1 MiB runs 2026-05-30T09:23:07Z
+=== SP1 (direct syscalls, no BLAKE3 PC) | mode=both | size=1m ===
+warning: Git tree '/home/schlarpc/waddup' has uncommitted changes
+waddup SP1 ZK Proof-of-Concept Benchmark
+=========================================
+Prover: cpu
+Mode:   SHA-256 (precompile) + BLAKE3 (software)
+
+--- SHA-256 (precompile) + BLAKE3 (software) | 1 MiB (1048576 bytes) ---
+  SHA-256 (journal):   fbbab289f7f94b25736c58be46a994c441fd02552cc6022352e3d86d2fab7c83
+  SHA-256 (native):    fbbab289f7f94b25736c58be46a994c441fd02552cc6022352e3d86d2fab7c83
+  SHA-256 match:       OK
+  BLAKE3  (journal):   64479cf7293960210547db8d982359e0c4ce054525ed7086cf93030828fc0533
+  BLAKE3  (native):    64479cf7293960210547db8d982359e0c4ce054525ed7086cf93030828fc0533
+  BLAKE3  match:       OK
+  Total user cycles:   33889038
+  Cycle tracker regions:
+    blake3:            27258340 cycles (26.00 cycles/byte)
+    sha256:            6621105 cycles (6.31 cycles/byte)
+  Syscall counts (non-zero):
+    SHA_COMPRESS               16385
+    SHA_EXTEND                 16385
+  Execute time:        948.021469ms
+[2m2026-05-30T09:23:58.183508Z[0m [33m WARN[0m Memory usage is high: 89.95%, we recommend using the prover network
+[2m2026-05-30T09:24:08.186876Z[0m [33m WARN[0m Memory usage is high: 90.06%, we recommend using the prover network
+[2m2026-05-30T09:24:18.187293Z[0m [33m WARN[0m Memory usage is high: 89.86%, we recommend using the prover network
+[2m2026-05-30T09:24:28.187429Z[0m [33m WARN[0m Memory usage is high: 90.07%, we recommend using the prover network
+[2m2026-05-30T09:24:38.189335Z[0m [33m WARN[0m Memory usage is high: 91.58%, we recommend using the prover network
+[2m2026-05-30T09:24:48.189467Z[0m [33m WARN[0m Memory usage is high: 91.84%, we recommend using the prover network
+[2m2026-05-30T09:24:58.189586Z[0m [33m WARN[0m Memory usage is high: 91.99%, we recommend using the prover network
+[2m2026-05-30T09:25:08.189705Z[0m [33m WARN[0m Memory usage is high: 92.03%, we recommend using the prover network
+[2m2026-05-30T09:25:18.189827Z[0m [33m WARN[0m Memory usage is high: 92.15%, we recommend using the prover network
+[2m2026-05-30T09:25:28.189951Z[0m [33m WARN[0m Memory usage is high: 92.02%, we recommend using the prover network
+[2m2026-05-30T09:25:38.190074Z[0m [33m WARN[0m Memory usage is high: 92.80%, we recommend using the prover network
+[2m2026-05-30T09:25:48.190195Z[0m [33m WARN[0m Memory usage is high: 92.89%, we recommend using the prover network
+[2m2026-05-30T09:25:58.190308Z[0m [33m WARN[0m Memory usage is high: 94.69%, we recommend using the prover network
+[2m2026-05-30T09:26:08.191317Z[0m [33m WARN[0m Memory usage is high: 96.62%, we recommend using the prover network
+=== SP1 + PR2615 BLAKE3 PC | size=1m | 2026-05-30T19:27:01Z ===
+warning: Git tree '/home/schlarpc/waddup' has uncommitted changes
+waddup SP1 BLAKE3-precompile bench (PR #2615 ported to v6.2.2)
+===============================================================
+
+--- SHA-256 (precompile) + BLAKE3 (PR #2615 precompile) | 1 MiB (1048576 bytes) ---
+  SHA-256 (journal):   fbbab289f7f94b25736c58be46a994c441fd02552cc6022352e3d86d2fab7c83
+  SHA-256 (native):    fbbab289f7f94b25736c58be46a994c441fd02552cc6022352e3d86d2fab7c83
+  SHA-256 match:       OK
+  BLAKE3  (journal):   e97ecfc21ba4c968fb4d39a42b3d5f05eef33a56221a85c1cd50de06988edd62
+  BLAKE3  (native):    64479cf7293960210547db8d982359e0c4ce054525ed7086cf93030828fc0533
+  BLAKE3  match:       MISMATCH!
+
+thread 'main' (1076774) panicked at bench/script/src/main.rs:57:5:
+assertion `left == right` failed
+  left: [233, 126, 207, 194, 27, 164, 201, 104, 251, 77, 57, 164, 43, 61, 95, 5, 238, 243, 58, 86, 34, 26, 133, 193, 205, 80, 222, 6, 152, 142, 221, 98]
+ right: [100, 71, 156, 247, 41, 57, 96, 33, 5, 71, 219, 141, 152, 35, 89, 224, 196, 206, 5, 69, 37, 237, 112, 134, 207, 147, 3, 8, 40, 252, 5, 51]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+=== SP1 + PR2615 BLAKE3 PC | size=1m (RERUN after BLAKE3 wrapper fix) | 2026-05-30T19:29:20Z ===
+warning: Git tree '/home/schlarpc/waddup' has uncommitted changes
+waddup SP1 BLAKE3-precompile bench (PR #2615 ported to v6.2.2)
+===============================================================
+
+--- SHA-256 (precompile) + BLAKE3 (PR #2615 precompile) | 1 MiB (1048576 bytes) ---
+  SHA-256 (journal):   fbbab289f7f94b25736c58be46a994c441fd02552cc6022352e3d86d2fab7c83
+  SHA-256 (native):    fbbab289f7f94b25736c58be46a994c441fd02552cc6022352e3d86d2fab7c83
+  SHA-256 match:       OK
+  BLAKE3  (journal):   64479cf7293960210547db8d982359e0c4ce054525ed7086cf93030828fc0533
+  BLAKE3  (native):    64479cf7293960210547db8d982359e0c4ce054525ed7086cf93030828fc0533
+  BLAKE3  match:       OK
+  Total user cycles:   10084485
+  Cycle tracker regions:
+    blake3:            3289562 cycles (3.14 cycles/byte)
+    sha256:            6785025 cycles (6.47 cycles/byte)
+  Syscall counts (non-zero):
+    BLAKE3_COMPRESS_INNER      17407
+    SHA_COMPRESS               16385
+    SHA_EXTEND                 16385
+  Execute time:        511.913746ms
+[2m2026-05-30T19:30:41.395379Z[0m [33m WARN[0m Memory usage is high: 94.46%, we recommend using the prover network
+[2m2026-05-30T19:30:51.395742Z[0m [33m WARN[0m Memory usage is high: 94.44%, we recommend using the prover network
+[2m2026-05-30T19:31:01.395878Z[0m [33m WARN[0m Memory usage is high: 94.46%, we recommend using the prover network
+[2m2026-05-30T19:31:11.396016Z[0m [33m WARN[0m Memory usage is high: 96.07%, we recommend using the prover network
+[2m2026-05-30T19:31:21.401534Z[0m [33m WARN[0m Memory usage is high: 96.00%, we recommend using the prover network
+[2m2026-05-30T19:31:31.401682Z[0m [33m WARN[0m Memory usage is high: 95.92%, we recommend using the prover network
+[2m2026-05-30T19:31:41.401817Z[0m [33m WARN[0m Memory usage is high: 95.91%, we recommend using the prover network
+[2m2026-05-30T19:31:51.401947Z[0m [33m WARN[0m Memory usage is high: 95.95%, we recommend using the prover network
+[2m2026-05-30T19:32:01.402408Z[0m [33m WARN[0m Memory usage is high: 98.71%, we recommend using the prover network
+[2m2026-05-30T19:32:11.408321Z[0m [33m WARN[0m Memory usage is high: 98.73%, we recommend using the prover network
+[2m2026-05-30T19:32:21.408476Z[0m [33m WARN[0m Memory usage is high: 98.88%, we recommend using the prover network
+=== Decomposed | size=128k (2 chunks) | 2026-05-30T20:33:25Z ===
+warning: Git tree '/home/schlarpc/waddup' has uncommitted changes
+waddup decomposed bench
+  file size:        131072 bytes (0 MiB)
+  proof chunk size: 65536 bytes
+  num chunk proofs: 2
+  blake3 leaves:    128 (64 per chunk)
+  expected SHA-256: 59f410ae5e17962412e2aed4f815918f634932f2abf084f00bb638c4db017850
+  expected BLAKE3:  24e9cbe9f25292cd57991ccab25ccbfcd965456b59098d3c3f7ff68db31ab941
+
+Setup phase:
+  ProverClient init: 23.789391435s
+  setup chunk pk:    2.212846575s
+  setup root pk:     2.137044285s
+
+Chunk proving phase (2 chunks):
+  chunk   1/  2: 119.298470733s
+  chunk   2/  2: 122.570730439s
+  total: 241.869201172s, avg per chunk: 120.934600586s
+
+Root proving phase:
+  root prove: 151.667587716s
+
+Results:
+  H_content (journal): 59f410ae5e17962412e2aed4f815918f634932f2abf084f00bb638c4db017850
+  H_content (native):  59f410ae5e17962412e2aed4f815918f634932f2abf084f00bb638c4db017850
+  H_content match:     OK
+  H_swarm   (journal): 24e9cbe9f25292cd57991ccab25ccbfcd965456b59098d3c3f7ff68db31ab941
+  H_swarm   (native):  24e9cbe9f25292cd57991ccab25ccbfcd965456b59098d3c3f7ff68db31ab941
+  H_swarm   match:     OK
+  root verify: 38.418886ms
+
+Wall-clock summary:
+  setup:        28.139282295s
+  chunk total:  241.869201172s
+  chunk avg:    120.934600586s
+  root prove:   151.667587716s
+  root verify:  38.418886ms
+  grand total:  421.714490069s
+=== Decomposed | size=1m (16 chunks) | 2026-05-30T20:40:49Z ===
+warning: Git tree '/home/schlarpc/waddup' has uncommitted changes
+waddup decomposed bench
+  file size:        1048576 bytes (1 MiB)
+  proof chunk size: 65536 bytes
+  num chunk proofs: 16
+  blake3 leaves:    1024 (64 per chunk)
+  expected SHA-256: fbbab289f7f94b25736c58be46a994c441fd02552cc6022352e3d86d2fab7c83
+  expected BLAKE3:  64479cf7293960210547db8d982359e0c4ce054525ed7086cf93030828fc0533
+
+Setup phase:
+  ProverClient init: 24.521199152s
+  setup chunk pk:    2.080419028s
+  setup root pk:     2.146379407s
+
+Chunk proving phase (16 chunks):
+  chunk   1/ 16: 121.412607371s
+  chunk   2/ 16: 118.871084365s
+  chunk   3/ 16: 118.319165417s
+  chunk   4/ 16: 118.182329753s
+  chunk   5/ 16: 117.440821589s
+  chunk   6/ 16: 117.836379225s
+  chunk   7/ 16: 116.467164685s
+  chunk   8/ 16: 117.861142867s
+  chunk   9/ 16: 116.826810839s
+  chunk  10/ 16: 117.68114738s
+  chunk  11/ 16: 117.628871019s
+  chunk  12/ 16: 118.528126706s
+  chunk  13/ 16: 116.628721861s
+  chunk  14/ 16: 117.837657413s
+  chunk  15/ 16: 117.105202005s
+  chunk  16/ 16: 116.868106591s
+  total: 1885.495339086s, avg per chunk: 117.843458692s
+
+Root proving phase:
+[2m2026-05-30T21:14:40.013675Z[0m [33m WARN[0m Memory usage is high: 81.87%, we recommend using the prover network
+[2m2026-05-30T21:15:20.014190Z[0m [33m WARN[0m Memory usage is high: 81.39%, we recommend using the prover network
+[2m2026-05-30T21:15:30.014308Z[0m [33m WARN[0m Memory usage is high: 80.49%, we recommend using the prover network
+[2m2026-05-30T21:15:40.014438Z[0m [33m WARN[0m Memory usage is high: 80.74%, we recommend using the prover network
+[2m2026-05-30T21:15:50.016557Z[0m [33m WARN[0m Memory usage is high: 86.31%, we recommend using the prover network
+  root prove: 385.947903104s
+
+Results:
+  H_content (journal): fbbab289f7f94b25736c58be46a994c441fd02552cc6022352e3d86d2fab7c83
+  H_content (native):  fbbab289f7f94b25736c58be46a994c441fd02552cc6022352e3d86d2fab7c83
+  H_content match:     OK
+  H_swarm   (journal): 64479cf7293960210547db8d982359e0c4ce054525ed7086cf93030828fc0533
+  H_swarm   (native):  64479cf7293960210547db8d982359e0c4ce054525ed7086cf93030828fc0533
+  H_swarm   match:     OK
+  root verify: 37.767563ms
+
+Wall-clock summary:
+  setup:        28.747997587s
+  chunk total:  1885.495339086s
+  chunk avg:    117.843458692s
+  root prove:   385.947903104s
+  root verify:  37.767563ms
+  grand total:  2300.22900734s
