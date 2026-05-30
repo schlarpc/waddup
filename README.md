@@ -1,62 +1,71 @@
 # waddup — ZK proof-of-concept benchmark
 
-Benchmarks RISC Zero zkVM proving and verification for the waddup hash-binding proof:
+Benchmarks RISC Zero and SP1 zkVM proving and verification for the waddup
+hash-binding proof:
 "I know a file F such that `ALG(F) = H_content` and `BLAKE3(F) = H_swarm`."
 
-Three guest programs:
+Three guest programs (mirrored across both provers):
 - `--both` — SHA-256 (precompile) + BLAKE3 (software). This is the actual waddup proof.
 - `--sha256` — SHA-256 only (precompile). Isolates precompile performance.
 - `--sha3` — SHA3-256 only (keccak precompile). Comparison point.
 
-All modes validate journal hashes against natively-computed values and report per-phase
-cycle counts from inside the guest via `env::cycle_count()`.
+All modes validate journal hashes against natively-computed values and report
+per-phase cycle counts.
+
+See [`RESEARCH.md`](RESEARCH.md) for the head-to-head comparison and the AMD-GPU
+acceleration story.
 
 ## Prerequisites
 
 - [Nix](https://nixos.org/) with flakes enabled
-- RISC Zero toolchain (`rzup`)
+- For RISC Zero: `rzup`
+- For SP1: `sp1up` (and `nix-ld` enabled system-wide, or run via `cargo prove
+  build --docker`)
 
 ## Setup
 
 ```
-# Install rzup (RISC Zero toolchain manager)
+# RISC Zero toolchain
 curl -L https://risczero.com/install | bash
+nix develop --command rzup install rust
 
-# Enter the nix dev shell (provides Rust, pkg-config, openssl)
-nix develop
-
-# Install the RISC Zero guest Rust toolchain
-rzup install rust
+# SP1 toolchain (requires nix-ld on NixOS; sp1-specific shell adds rustup)
+curl -L https://sp1up.succinct.xyz | bash
+nix develop .#sp1 --command bash -c 'rustup default stable && ~/.sp1/bin/sp1up'
 ```
 
 ## Run
+
+### RISC Zero
 
 ```
 nix develop --command cargo run --release -- [--both|--sha256|--sha3] <sizes...>
 ```
 
-Sizes accept `k` and `m` suffixes (e.g. `10k`, `1m`). Defaults to `10k` if omitted.
+### SP1
 
 ```
-# SHA-256 + BLAKE3 at 1k, 10k, 100k
-nix develop --command cargo run --release -- --both 1k 10k 100k
-
-# SHA-256 only at 10k
-nix develop --command cargo run --release -- --sha256 10k
-
-# SHA3-256 only at 10k
-nix develop --command cargo run --release -- --sha3 10k
+nix develop .#sp1 --command cargo run --release --manifest-path sp1/script/Cargo.toml \
+    -- [--both|--sha256|--sha3] <sizes...>
 ```
 
-First build takes several minutes (compiles RISC Zero + guest programs to RISC-V).
+Sizes accept `k` and `m` suffixes (e.g. `10k`, `1m`). Defaults to `10k` if
+omitted. First build takes several minutes per prover.
+
+### Full matrix
+
+```
+scripts/run-benches.sh           # writes RESULTS_RAW.md
+```
 
 ## GPU backends
 
-Set `RISC0_PROVER` to use a GPU backend:
+For RISC Zero, set `RISC0_PROVER`:
 
 ```
 RISC0_PROVER=cuda cargo run --release -- 10k    # NVIDIA (real speedup, ~4-7x)
 RISC0_PROVER=metal cargo run --release -- 10k   # Apple (slower than CPU in practice)
 ```
 
-CUDA requires `rzup install cpp`. Metal requires macOS.
+CUDA requires `rzup install cpp`. Metal requires macOS. **AMD/ROCm/HIP is not
+supported by either RISC Zero or SP1 today** — see `RESEARCH.md` Part 1.

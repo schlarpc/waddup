@@ -1,0 +1,346 @@
+# waddup — GPU acceleration and SP1 comparison
+
+Companion research note to `PROPOSAL.md`. Two questions investigated:
+
+1. Now that we've moved from WSL to native Linux on an AMD CPU + AMD GPU, how does
+   that change the proving-throughput story for RISC Zero?
+2. Could SP1 (the other major Rust-based RISC-V zkVM) do this proof faster or with
+   different tradeoffs? Specifically reimplementing the SHA-256 + BLAKE3 hash binding.
+
+Test machine: Ryzen 7 5800X (8c/16t Zen 3, AVX2, no AVX-512), 64 GiB RAM, AMD Radeon
+RX 7900 XT (Navi 31, RDNA3, 20 GiB VRAM), NixOS, Linux 6.19.12.
+
+All proving runs are CPU-only on this machine. Numbers below are single-run wall
+clocks (no warm-up, no averaging), captured in `RESULTS_RAW.md`. Treat them as
+indicative — within 10-15% reproducibility is realistic.
+
+---
+
+## Part 1 — AMD GPU acceleration
+
+### TL;DR
+
+Neither RISC Zero nor SP1 has a working AMD GPU backend in 2026-05. Both are
+CUDA-only. Switching from WSL to native Linux helps the **CPU** prover (large
+pages, native syscalls, no I/O bridging), but does **not** unlock GPU acceleration
+on a Radeon — that capability simply doesn't exist upstream yet. The only credible
+near-term vector is RISC Zero's stalled draft PR [#3725 (CubeCL HAL port)][r3725].
+
+### Why the CUDA paths can't just be `hipify`'d
+
+Both provers' CUDA paths are not vanilla CUDA, they're tightly bound to libraries
+that themselves do not support HIP:
+
+- **RISC Zero**: `risc0-sys` compiles `kernels/zkp/cuda/supra/{ntt,poseidon2,api}.cu`
+  on top of [Supranational's `sppark`][sppark] plus `blst`. RISC Zero now vendors a
+  fork (`risc0-sppark`) per [PR #3478][r3478]. sppark uses NVIDIA-specific PTX/CUB
+  constructs and warp semantics — naive `hipify` does not produce working ROCm
+  kernels for the NTT pipeline. The Rust side is `cust` (NVIDIA-only).
+- **SP1**: GPU prover docs hard-require [CUDA 12 + compute capability ≥8.6 and
+  ≥24 GiB VRAM][sp1hw]. Zero ROCm/HIP/Radeon-related issues, PRs, or forks in
+  `succinctlabs/sp1` (searched for "AMD", "ROCm", "HIP", "Radeon", "RDNA"). The
+  multi-GPU service (`sp1-cluster`) and all published benchmarks reference only
+  RTX 4090/5090 and AWS `g6`.
+
+Sister STARK GPU libraries are similarly Nvidia-only — Ingonyama [ICICLE][icicle]
+(the dominant ZK GPU lib, supports BabyBear NTTs) is CUDA + CPU only; Plonky3 and
+Stwo have no GPU backends merged at all.
+
+### The one credible path: RISC Zero PR #3725 (CubeCL HAL)
+
+[PR #3725 "Experiment with cubecl"][r3725], opened 2026-02-25 by `flaub` (RISC Zero
+core team), rewrites the HAL plus NTT and Poseidon2 kernels on top of
+[CubeCL][cubecl], a Rust GPU compute framework with backends for CUDA, **HIP/ROCm**
+([cubecl-hip][cubeclhip]), WGPU, Metal, and SPIR-V. New files include
+`risc0/zkp/src/hal/cubecl/{hal,ntt,poseidon2,kernels}.rs`. Status: ~8200 LOC, draft,
+**stalled since 2026-02-26**, marked dirty/draft. If it ever ships clean, the RX
+7900 XT becomes a viable backend overnight.
+
+Driving #3725 to a working state on our hardware was scoped as out of bounds for
+this investigation (days of engineering with no guarantee of success). Documented
+here as the recommended waypoint to monitor.
+
+### What "native Linux" actually buys us
+
+- **CPU prover**: native Linux generally outperforms WSL2 on the same hardware for
+  compute-heavy workloads, mostly via lower syscall overhead, no I/O bridging, and
+  access to transparent huge pages. RISC Zero CPU benchmarks rerun on this Linux
+  box are the new baseline for any future SP1/GPU comparison — see Part 2.
+- **SIMD**: Ryzen 5800X (Zen 3) has AVX2 but no AVX-512. SP1's CPU prover ships an
+  AVX-512 path that is **not** available on this CPU; the AVX2 path is. SP1
+  benchmarks would improve materially on a Zen 4+ or Intel Sapphire Rapids box.
+- **GPU**: no acceleration without engineering work. ZLUDA (CUDA-on-ROCm reimpl) is
+  a theoretical alternate path but neither prover has been tested against it and
+  ZLUDA's PTX coverage is incomplete — a low-confidence attempt for moderate
+  effort.
+
+### Recommendation
+
+Treat the RX 7900 XT as latent capacity for the medium term. Watch [PR #3725][r3725]
+for revival; when it lands, immediately rebench. For now, capacity planning should
+assume CPU proving on this machine, with the published CUDA speedup ratios in
+`PROPOSAL.md` (§ "CPU vs GPU Proving Throughput") as an upper bound — not what
+this Radeon will deliver as is.
+
+[r3725]: https://github.com/risc0/risc0/pull/3725
+[r3478]: https://github.com/risc0/risc0/pull/3478
+[sppark]: https://github.com/supranational/sppark
+[sp1hw]: https://docs.succinct.xyz/docs/sp1/generating-proofs/hardware-acceleration
+[icicle]: https://github.com/ingonyama-zk/icicle
+[cubecl]: https://github.com/tracel-ai/cubecl
+[cubeclhip]: https://lib.rs/crates/cubecl-hip
+
+---
+
+## Part 2 — SP1 vs RISC Zero, head to head
+
+### Setup
+
+- RISC Zero zkVM **v3.0.5** (cargo-prove via rzup 0.5.0, succinct rust toolchain
+  1.94.1), CPU prover.
+- SP1 zkVM **v6.2.2** (cargo-prove `150e629`, succinct rust 1.93.0-dev), CPU
+  prover.
+
+Guest programs mirror the existing RISC Zero programs:
+
+- `sp1/programs/hash-prover` — SHA-256 + BLAKE3 (the actual waddup proof)
+- `sp1/programs/sha256-only` — SHA-256 precompile isolation
+- `sp1/programs/sha3-only` — SHA3-256 (keccak) precompile isolation
+
+Driver: `nix develop .#sp1 --command cargo run --release --manifest-path sp1/script/Cargo.toml -- [--both|--sha256|--sha3] <sizes...>`
+
+Each benchmark first calls `client.execute(elf, stdin)` to collect cycle counts
+via SP1's `cycle-tracker-report-*` markers (requires `sp1-sdk` "profiling"
+feature), then calls `client.prove(&pk, stdin).run()` to measure wall-clock
+proving.
+
+### Finding 1 — SP1's official precompile patches are broken on v6.x
+
+The single most surprising thing this investigation turned up. The
+[`sp1-patches/RustCrypto-hashes`][sp1patches] (`patch-sha2-v0.10.8`) and
+[`sp1-patches/tiny-keccak`][sp1patches] (`patch-v2.0.2`) branches that the SP1
+docs and SDK templates point you at to enable hash precompiles **do not actually
+dispatch the precompile when built for SP1 v6.x**.
+
+Two issues compound:
+
+1. **Target gate is `riscv32`-only.** The patched `sha2/src/sha256.rs` selects
+   the succinct dispatch with
+   `#[cfg(all(target_os = "zkvm", target_vendor = "succinct", target_arch = "riscv32"))]`.
+   SP1 v6 changed its default target to `riscv64im-succinct-zkvm-elf`. The cfg
+   doesn't match, so the patched crate silently falls back to the pure-Rust
+   `mod soft` compress.
+2. **Syscall ABI is u32-pointer.** Even if the cfg gate is fixed, the patched
+   crate declares `extern "C" { fn syscall_sha256_extend(w: *mut u32); }` and
+   passes a `[u32; 64]` buffer. SP1 v6's `sp1-lib` redefined the syscalls as
+   `*mut [u64; 64]` — same logical content, but the executor expects 512 bytes,
+   not 256.
+
+Telltale signature: with the documented patch setup, `report.syscall_counts` is
+empty for SHA_EXTEND / SHA_COMPRESS / KECCAK_PERMUTE; the cycle tracker reports
+**~60 cycles/byte for SHA-256** instead of the ~8 c/B that the actual precompile
+delivers, even while the output hash still matches (because the software fallback
+ran). It's an easy regression for a user to ship without noticing.
+
+There is a half-published in-progress fix for tiny-keccak —
+`sp1-patches/tiny-keccak#tamir/sp1-6.2.0-pre` drops the `riscv32` gate and uses
+`sp1_lib::syscall_keccak_permute` directly — but its `sp1-lib` dep points at a
+`tamir/no_std_zkvm` branch on `succinctlabs/sp1` that no longer exists, so it
+fails to fetch and the patch silently doesn't apply. There is no equivalent
+in-progress fix for the sha2 patch.
+
+**Workaround (used here).** We dropped the patched crates entirely and added a
+small `sp1/programs/precompiles-lib` module with `sha256()` and `sha3_256()`
+wrappers that call `sp1_lib::syscall_sha256_extend`,
+`sp1_lib::syscall_sha256_compress`, and `sp1_lib::syscall_keccak_permute`
+directly with the correct u64 ABI. Each wrapper is under 50 lines. Hashes
+verified against `sha2::Sha256` and `tiny_keccak::Sha3` on the host. Both code
+paths — "documented patch setup" (broken precompile) and "direct syscalls"
+(working precompile) — are reported below for honesty about what an off-the-shelf
+SP1 user gets vs. what's achievable.
+
+The implication for adoption: as of 2026-05, the canonical "follow the docs"
+SP1 setup will silently leave SHA-256 and Keccak running as plain RV64 software
+on v6.x, costing roughly an order of magnitude in cycles. This is reportable to
+upstream and is mostly a maintenance gap, not an architectural problem.
+
+[sp1patches]: https://github.com/sp1-patches
+
+### Finding 2 — Head-to-head numbers (CPU prover, native Linux, Ryzen 5800X)
+
+All times are single-run wall clocks; cycles are from the in-guest tracker.
+**RZ** = RISC Zero v3.0.5, **SP1** = SP1 v6.2.2. SP1 numbers are with direct
+syscalls (Finding 1 workaround) unless noted. "SP1 (docs)" is the same code but
+with the standard patched-sha2/tiny-keccak setup that is currently broken.
+
+#### Per-region cycles per byte
+
+| Mode      | Size    | RZ sha256 | SP1 sha256 (direct) | SP1 sha256 (docs) | RZ blake3 | SP1 blake3 | RZ sha3 | SP1 sha3 (direct) | SP1 sha3 (docs) |
+|-----------|---------|-----------|---------------------|-------------------|-----------|------------|---------|-------------------|-----------------|
+| sha256    | 1 KiB   | 2.2       | 8.2                 | 64.0              | —         | —          | —       | —                 | —               |
+| sha256    | 10 KiB  | 1.2       | 6.5                 | 59.7              | —         | —          | —       | —                 | —               |
+| sha3      | 1 KiB   | —         | —                   | —                 | —         | —          | 16.7    | 3.5               | 57.9            |
+| sha3      | 10 KiB  | —         | —                   | —                 | —         | —          | 15.6    | 3.2               | 55.0            |
+| both      | 1 KiB   | 2.2       | 8.2                 | 64.0              | 25.2      | 24.6       | —       | —                 | —               |
+| both      | 10 KiB  | 1.2       | 6.5                 | 59.7              | 26.5      | 25.8       | —       | —                 | —               |
+| both      | 100 KiB | 1.1       | 6.3                 | 59.2              | 26.7      | 26.0       | —       | —                 | —               |
+
+Caveats: SP1 c/B numbers include precompile execution latency (SHA_EXTEND=64,
+SHA_COMPRESS=72, KECCAK_PERMUTE=25 per call); RISC Zero c/B is pure rv32im
+instructions. See Finding 3.
+
+#### Total user cycles for the full guest
+
+| Mode      | Size    | RZ        | SP1 (direct) | SP1 (docs)  |
+|-----------|---------|-----------|--------------|-------------|
+| sha256    | 1 KiB   | 10,997    | 13,647       | 70,719      |
+| sha256    | 10 KiB  | 38,610    | 71,823       | 616,047     |
+| sha3      | 1 KiB   | 28,251    | 8,873        | 64,574      |
+| sha3      | 10 KiB  | 188,614   | 38,101       | 567,958     |
+| both      | 1 KiB   | 37,027    | 43,255       | 100,329     |
+| both      | 10 KiB  | 310,651   | 340,848      | 885,074     |
+| both      | 100 KiB | 3,006,275 | 3,318,498    | 8,734,244   |
+
+#### Wall-clock proving time
+
+| Mode      | Size    | RZ        | SP1 (direct)  | SP1 (docs)    |
+|-----------|---------|-----------|---------------|---------------|
+| sha256    | 1 KiB   | 6.22s     | 23.76s        | 22.85s        |
+| sha256    | 10 KiB  | 12.65s    | 23.91s        | 29.12s        |
+| sha3      | 1 KiB   | 49.03s    | 27.87s        | 23.19s        |
+| sha3      | 10 KiB  | 68.73s    | 29.87s        | 27.19s        |
+| both      | 1 KiB   | 12.73s    | 23.71s        | 24.24s        |
+| both      | 10 KiB  | 53.14s    | 27.91s        | 32.58s        |
+| both      | 100 KiB | 339.84s   | 73.03s        | 124.50s       |
+
+Verification: RZ ~13-90 ms per receipt, SP1 ~85-140 ms per core proof. Both
+sub-millisecond once compressed to Groth16, but compression to Groth16 was not
+exercised here.
+
+### Finding 3 — Cycle-count comparison is misleading on its own
+
+SP1's "user cycle" / `global_clk` accounting adds precompile execution latency
+(SHA_EXTEND=64, SHA_COMPRESS=72, KECCAK_PERMUTE=25 per call) on top of the
+rv32im/rv64im instruction count, so SP1's reported cycles per region include
+work that RISC Zero's `env::cycle_count()` (a pure rv32im instruction count) does
+not. Direct cycle-to-cycle comparison without normalizing this difference looks
+worse for SP1 than the wall clock actually is.
+
+Concretely: at 10 KiB SHA-256, the precompile is invoked 161 times. The
+syscall-latency contribution alone is 161 × (64 + 72) = ~22K "cycles" — about a
+third of SP1's measured 66K cycles for that region. The remaining ~44K cycles
+are the actual rv64im instructions in the wrapper (buffer scan, byte→u64
+load, padding). For RISC Zero, `cycle_count` returns 12K — only the rv32im
+instruction count, the precompile work itself is invisible to that counter
+because RISC Zero's SHA-256 accelerator is part of the segment circuit, not a
+syscall whose latency is added to the user count.
+
+**Right comparison is wall-clock proving time per byte.**
+
+### Finding 4 — At small sizes RISC Zero is faster; at large sizes SP1 is
+
+This is the headline tradeoff for waddup. Looking at the sha256+blake3 mode
+(the actual waddup proof):
+
+| Size    | RZ prove  | SP1 prove | SP1/RZ |
+|---------|-----------|-----------|--------|
+| 1 KiB   | 12.73s    | 23.71s    | 1.86x  |
+| 10 KiB  | 53.14s    | 27.91s    | 0.53x  |
+| 100 KiB | 339.84s   | 73.03s    | 0.21x  |
+
+SP1's fixed proving overhead (Hypercube setup, multi-table lookup tables,
+recursion/compression scaffolding) is roughly 20-25s independent of input size,
+which dominates for small files. RISC Zero starts faster but its proving cost
+scales more steeply with cycles, so SP1 takes over once total work exceeds a
+crossover point. **The crossover for the waddup hash binding is between 1 KiB
+and 10 KiB.** At 100 KiB, SP1 is ~4.6x faster wall-clock; that gap continues to
+widen with size (RISC Zero's curve is steeper).
+
+For the waddup use case — package mirrors and Linux distro seeds where median
+file size sits between 10 KiB and 100 MiB — SP1's better scaling on CPU is
+materially relevant. For something with many small inputs (e.g., per-chunk
+proofs of a few hundred bytes each) RISC Zero is the better fit. A real
+deployment would benchmark at the actual workload's size distribution before
+picking.
+
+### Finding 5 — SP1's keccak precompile is far cheaper to prove than RISC Zero's
+
+Even at the smallest 1 KiB workload, SP1's SHA3 proving (28s with working
+precompile) beats RISC Zero (49s). At 10 KiB it's 27s vs 69s. RISC Zero's
+keccak circuit is a separate AIR with its own recursion and lift/join cost; SP1's
+keccak permutation is a precompile chip that folds into the main proof. This
+reinforces the `PROPOSAL.md` recommendation to avoid SHA3 as the binding hash —
+keccak is structurally penalized in RISC Zero's prover, less so in SP1's, but
+still bad relative to SHA-256 in both.
+
+### BLAKE3 precompile (SP1 PR #2615)
+
+[PR #2615][s2615] adds a single syscall `syscall_blake3_compress_inner` (id
+`0x00_01_01_34`) exposing the 7-round Blake3 compression function. It has been
+open since 2026-02, currently `OPEN + CONFLICTING` against the `dev` branch,
+last touched 2026-02. There is no patched `blake3` crate that automatically
+dispatches to it — the PR's own test program calls the syscall directly with a
+fixed 16-word state. Wiring it into a real BLAKE3-of-file guest would require
+writing a BLAKE3 chunker/tree-mode wrapper that swaps in the precompile for the
+inner compression.
+
+Status: not benchmarked in this run. To actually exercise it, we'd need to
+build cargo-prove + the entire SP1 stack from `swapnilraj/sp1@5015f02` (the PR's
+workspace is at SP1 v6.0.1 vs. our installed v6.2.2 — installed `cargo-prove`
+won't recognize the syscall code without an executor rebuild). The
+`programs/precompiles-lib` workaround from Finding 1 illustrates the size of
+the task: a usable BLAKE3 wrapper would be ~200 lines (chunk loop, CV stack,
+tree finalize) plus the syscall calls. Tractable but not done here.
+
+**Architectural parity reminder.** RISC Zero v1.2+ supports
+*application-defined precompiles* (PROPOSAL.md § "Application-Defined BLAKE3
+Precompile"). Any speedup the SP1 PR demonstrates is replicable on RISC Zero
+with the same engineering investment. The PR is interesting as a
+free-once-merged data point, not as a permanent architectural advantage.
+
+**Expected impact.** At 10 KiB the BLAKE3 region is 271K (RZ) / 264K (SP1)
+cycles, vs ~12K for SHA-256 with precompile — BLAKE3 dominates the hash work by
+~20x. The PR-described chip uses 104 rows per `compress_inner` invocation. At
+10 KiB that's roughly 160 compress calls → ~16K precompile rows vs ~270K rv32im
+rows today — roughly 17x less proving work for the BLAKE3 portion if precompile
+proving cost is comparable per row to rv32im (it generally is or better, since
+the chip is specialized). Plausible: BLAKE3 stops being the bottleneck in the
+binding proof; SHA-256 becomes the next-largest contributor.
+
+[s2615]: https://github.com/succinctlabs/sp1/pull/2615
+
+### NixOS-specific friction (worth documenting)
+
+For reproducibility on NixOS:
+
+- SP1's prebuilt toolchain (`sp1up`) downloads glibc-linked binaries that do
+  not run on stock NixOS. With `programs.nix-ld.enable = true;` (already on
+  this box), `cargo-prove` runs unpatched. Docker (`cargo prove build --docker`)
+  is the alternative.
+- `cargo-prove prove install-toolchain` requires `rustup` for the `toolchain
+  link succinct ...` step. The existing `devShells.default` shell uses
+  rust-overlay (no `rustup`), so we added `devShells.sp1` with `rustup` plus
+  `protobuf`/`git`/`curl`/`gcc` and let it manage both a default stable and the
+  succinct toolchain. See `flake.nix`.
+- RISC Zero (`rzup`) had no friction beyond needing to be run inside a shell
+  that has `rustc` available so its preflight check passes.
+
+---
+
+## Bottom line
+
+1. **AMD GPU is not an option today** for either prover. Watch RISC Zero PR
+   #3725. Native Linux is still worth it for CPU throughput; the cross-prover
+   comparison above is on a competent but not state-of-the-art CPU.
+2. **For the waddup proof (SHA-256 + BLAKE3)** as it stands today (no BLAKE3
+   precompile in either prover), the choice between SP1 and RISC Zero is a
+   size-dependent tradeoff: RISC Zero wins on small files (faster fixed cost),
+   SP1 wins on medium-to-large files (better scaling). The crossover for this
+   workload is somewhere around 10-30 KiB on CPU.
+3. **Adding a BLAKE3 precompile** (SP1 PR or RISC Zero app-defined) would be a
+   larger win than the prover choice. Plan the engineering effort there if
+   proving cost is the bottleneck.
+4. **The SP1 ecosystem has rough edges on v6.x.** The official precompile
+   patches don't dispatch; without fixing this you get pure-software hashes and
+   ~10x worse cycle counts. Worth filing upstream and worth doing the trivial
+   workaround in any real SP1 deployment.
