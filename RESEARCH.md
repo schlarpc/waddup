@@ -72,18 +72,94 @@ here as the recommended waypoint to monitor.
   AVX-512 path that is **not** available on this CPU; the AVX2 path is. SP1
   benchmarks would improve materially on a Zen 4+ or Intel Sapphire Rapids box.
 - **GPU**: no acceleration without engineering work. ZLUDA (CUDA-on-ROCm reimpl) is
-  a theoretical alternate path but neither prover has been tested against it and
-  ZLUDA's PTX coverage is incomplete — a low-confidence attempt for moderate
-  effort.
+  a theoretical alternate path; we actually tried it (see § "ZLUDA result" below).
+  Bottom line: doesn't currently work end-to-end for RZ; SP1 not tested but would
+  hit similar issues.
+
+### ZLUDA result (actually tested)
+
+After this doc was first drafted, [ZLUDA v6-preview.75][zluda] (CUDA-on-ROCm
+shim) was installed on this box. Worth probing whether RZ's CUDA backend or
+SP1's GPU prover work through it on the RX 7900 XT, even partially.
+
+**Setup.** ZLUDA v6 ships `libcuda.so` plus `libcublas`, `libcublasLt`,
+`libcufft`, `libcusparse`, `libcudnn`. The `zluda-run` wrapper prepends
+`LD_LIBRARY_PATH` so the application's `libcuda.so.1` dlopen resolves to
+ZLUDA's. Basic GPU detection works — a hand-written probe calling `cuInit`,
+`cuDeviceGetCount`, `cuDeviceGetName` reports the 7900 XT correctly as
+`"AMD Radeon RX 7900 XTX [ZLUDA]"`.
+
+**Building RZ with CUDA.** Enable the `cuda` feature on `risc0-zkvm`. This
+pulls in `cust`, `sppark`, and `risc0-circuit-{rv32im,recursion,keccak}-sys`
+which need a real CUDA toolkit at build time (headers + `nvcc` + libcuda
+stub for linking). On NixOS that means assembling a build env with:
+- `nixpkgs#cudaPackages.cudatoolkit` (unfree; sets `CUDA_PATH`, provides
+  `nvcc` + headers + `lib/stubs/libcuda.so` for build-time linking)
+- A `lib64` symlink shim because `find_cuda_helper` searches `<root>/lib64/`,
+  and nixpkgs' `cuda-merged` has `lib/`
+- An `nvcc` wrapper because RZ's `risc0-build-kernel` hardcodes
+  `-arch=native`, which nvcc cannot resolve without a real NVIDIA GPU
+  present at compile time. The wrapper rewrites it to `-arch=sm_86` and
+  also adds `-DNDEBUG` to strip device-side asserts that NVCC otherwise
+  refuses (`__assert_fail` is a host-only function in device code).
+- `nixpkgs#protobuf` (`PROTOC` env), `nixpkgs#llvmPackages.libclang.lib`
+  (`LIBCLANG_PATH` env), `nixpkgs#glibc.dev` (`BINDGEN_EXTRA_CLANG_ARGS`
+  with `-isystem` for `stdlib.h`).
+
+After ~5 minutes of conflict resolution and one ~7 minute build, the host
+binary links successfully against the cuda stub. `nm` confirms `cuInit`
+and friends as undefined symbols expected from the dynamic linker.
+
+**Running RZ under ZLUDA.** `zluda-run` resolves `libcuda.so.1` to ZLUDA's
+implementation. `RISC0_PROVER=local` (the default with the `prove` feature
+plus `cuda` flag) picks the in-process CUDA-enabled prover. The binary
+starts up, initialises CUDA via ZLUDA (`cuInit` returns 0, context creation
+succeeds, kernel compilation proceeds), then panics on the first kernel
+launch:
+
+```
+called `Result::unwrap()` on an `Err` value:
+  cudaLaunchKernelEx(&config, kernel, ...)@kernels/zkp/cuda/cuda.h:92
+  failed: "named symbol not found"
+```
+
+The kernel in question is `risc0_zkp_cuda_scatter` (one of RZ's polynomial-
+commitment scatter kernels in `risc0-zkp/src/hal/cuda.rs:890`). The failure
+is consistent — every run hits it at the same call. The kernel itself is
+compiled fine (the PTX module loads); ZLUDA's `cudaLaunchKernelEx`
+implementation just can't resolve the kernel function by name at launch
+time. Likely a PTX name-mangling / function-descriptor mismatch in
+ZLUDA's coverage of `cudaLaunchKernelEx`, since `cudaLaunchKernel` (the
+older, simpler launch API) appears to be more widely supported.
+
+The process also panics during exit cleanup on
+`<DarkApi as CudaDarkApi>::context_local_storage_get` called from
+`gpus_t::~gpus_t() → cudaStreamDestroy` — a second ZLUDA coverage gap,
+unrelated to the actual prove failure but visible in the stack trace.
+
+**SP1 under ZLUDA: not tested.** SP1's GPU prover requires building
+`sp1-cuda` (a separate prover server process the SDK connects to over IPC),
+which itself wants newer PTX features than RZ's sppark kernels. Given RZ
+fails on basic kernel launch resolution, SP1 — which exercises broader
+PTX surface — is very unlikely to fare better without ZLUDA-side fixes.
+
+**Status:** ZLUDA + RZ doesn't work end-to-end on this AMD GPU today.
+The failure is well-scoped (kernel symbol resolution in `cudaLaunchKernelEx`),
+fixable in principle by working with ZLUDA upstream or by patching RZ to
+fall back to `cuLaunchKernel`, but neither is a quick win. ZLUDA is a
+legitimate target to keep tracking — coverage is improving — but right now
+it doesn't unlock the 7900 XT for either prover.
 
 ### Recommendation
 
-Treat the RX 7900 XT as latent capacity for the medium term. Watch [PR #3725][r3725]
-for revival; when it lands, immediately rebench. For now, capacity planning should
-assume CPU proving on this machine, with the published CUDA speedup ratios in
-`PROPOSAL.md` (§ "CPU vs GPU Proving Throughput") as an upper bound — not what
-this Radeon will deliver as is.
+Treat the RX 7900 XT as latent capacity for the medium term. Watch
+[PR #3725][r3725] (RZ → CubeCL) AND ZLUDA's `cudaLaunchKernelEx` work; either
+landing would unlock the GPU. For now, capacity planning should assume CPU
+proving on this machine, with the published CUDA speedup ratios in
+`PROPOSAL.md` (§ "CPU vs GPU Proving Throughput") as an upper bound — not
+what this Radeon will deliver as is.
 
+[zluda]: https://github.com/vosen/ZLUDA
 [r3725]: https://github.com/risc0/risc0/pull/3725
 [r3478]: https://github.com/risc0/risc0/pull/3478
 [sppark]: https://github.com/supranational/sppark
