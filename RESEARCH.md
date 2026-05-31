@@ -110,54 +110,131 @@ After ~5 minutes of conflict resolution and one ~7 minute build, the host
 binary links successfully against the cuda stub. `nm` confirms `cuInit`
 and friends as undefined symbols expected from the dynamic linker.
 
-**Running RZ under ZLUDA.** `zluda-run` resolves `libcuda.so.1` to ZLUDA's
-implementation. `RISC0_PROVER=local` (the default with the `prove` feature
-plus `cuda` flag) picks the in-process CUDA-enabled prover. The binary
-starts up, initialises CUDA via ZLUDA (`cuInit` returns 0, context creation
-succeeds, kernel compilation proceeds), then panics on the first kernel
-launch:
+**First run, surface symptom.** `zluda-run` resolves `libcuda.so.1` to
+ZLUDA's implementation. `RISC0_PROVER=local` (the default with the `prove`
+feature plus `cuda` flag) picks the in-process CUDA-enabled prover. The
+binary starts up, initialises CUDA via ZLUDA (`cuInit` returns 0, context
+creation succeeds, the PTX module *appears* to load), then panics on the
+first kernel launch:
 
 ```
-called `Result::unwrap()` on an `Err` value:
-  cudaLaunchKernelEx(&config, kernel, ...)@kernels/zkp/cuda/cuda.h:92
+cudaLaunchKernelEx(&config, kernel, ...)@kernels/zkp/cuda/cuda.h:92
   failed: "named symbol not found"
 ```
 
-The kernel in question is `risc0_zkp_cuda_scatter` (one of RZ's polynomial-
-commitment scatter kernels in `risc0-zkp/src/hal/cuda.rs:890`). The failure
-is consistent — every run hits it at the same call. The kernel itself is
-compiled fine (the PTX module loads); ZLUDA's `cudaLaunchKernelEx`
-implementation just can't resolve the kernel function by name at launch
-time. Likely a PTX name-mangling / function-descriptor mismatch in
-ZLUDA's coverage of `cudaLaunchKernelEx`, since `cudaLaunchKernel` (the
-older, simpler launch API) appears to be more widely supported.
+The kernel in question is `risc0_zkp_cuda_scatter`. Process also panics
+during exit cleanup on `DarkApi::context_local_storage_get →
+cudaStreamDestroy` — separate ZLUDA coverage gap, irrelevant to the
+prove failure but visible in the stack trace.
 
-The process also panics during exit cleanup on
-`<DarkApi as CudaDarkApi>::context_local_storage_get` called from
-`gpus_t::~gpus_t() → cudaStreamDestroy` — a second ZLUDA coverage gap,
-unrelated to the actual prove failure but visible in the stack trace.
+**Real root cause** (which took some digging). It is not a
+`cudaLaunchKernelEx`-API gap in ZLUDA, as I first guessed. It is the
+combination of two structural facts:
 
-**SP1 under ZLUDA: not tested.** SP1's GPU prover requires building
-`sp1-cuda` (a separate prover server process the SDK connects to over IPC),
-which itself wants newer PTX features than RZ's sppark kernels. Given RZ
-fails on basic kernel launch resolution, SP1 — which exercises broader
-PTX surface — is very unlikely to fare better without ZLUDA-side fixes.
+1. **RZ ships its CUDA kernels rdc-linked.** Each `risc0-*-sys` crate has
+   many `.cu` files that reference each other's `__device__` functions
+   (e.g. `step_exec` is defined in one file, called from another). cc-rs's
+   `cuda(true)` mode adds `--device-c` to every per-CU compile, then
+   does one `--device-link` step per crate. The per-CU `.o` files carry
+   `__nv_relfatbin` (relocatable intermediate fatbin, contains PTX). The
+   linked `dlink.o` carries `.nv_fatbin` containing the merged SASS
+   cubin — **and by default that linked fatbin drops the PTX backups**.
+   Dropping `--device-c` removes the issue but breaks the cross-CU
+   references: ptxas fails with `Unresolved extern function
+   '_Z9step_execPvjjP2FpS1_S1_S1_S1_'` and friends.
 
-**Status:** ZLUDA + RZ doesn't work end-to-end on this AMD GPU today.
-The failure is well-scoped (kernel symbol resolution in `cudaLaunchKernelEx`),
-fixable in principle by working with ZLUDA upstream or by patching RZ to
-fall back to `cuLaunchKernel`, but neither is a quick win. ZLUDA is a
-legitimate target to keep tracking — coverage is improving — but right now
-it doesn't unlock the 7900 XT for either prover.
+2. **NVCC has a flag for this**, that I missed on the first pass:
+   `--relocatable-ptx` (`-reloc-ptx`), documented as *"insert PTX from
+   relocatable fatbins within objects into the result fatbin."* Adding
+   `--relocatable-ptx` to the `--device-link` invocation expanded the
+   binary's PTX backups from 1 entry to 48 (one per per-CU compile in
+   each linked fatbin).
+
+But the launch failure persisted, identical error. The actual blocker:
+
+3. **ZLUDA's `get_best_ptx_and_compile`
+   ([zluda/src/impl/module.rs](https://github.com/vosen/ZLUDA/blob/main/zluda/src/impl/module.rs))
+   picks at most one PTX per fatbin.** It iterates the PTX entries in a
+   fatbin, parses each with `ptx_parser`, and breaks on the first cleanly
+   parsing module:
+
+   ```rust
+   ptx_modules.iter().rev() // TODO: actually sort by SM
+       .try_fold(None, |acc, src| {
+           if ast.invalid_directives == 0 {
+               return ControlFlow::Break((src, ast));   // <-- here
+           }
+           ...
+       })
+   ```
+
+   RZ's keccak/zkp/rv32im fatbins each contain *multiple* per-CU PTX
+   modules (`eltwise.ptx`, `combos.ptx`, `kernels.ptx` — the one with
+   `scatter` — `sha.ptx`, ...). ZLUDA picks the first cleanly-parsing
+   one and discards the rest. When cudart later asks for `scatter`,
+   ZLUDA's loaded HIP module simply doesn't contain it.
+
+That is the actual failure. The kernel was compiled, the PTX is in the
+binary, and ZLUDA isn't using the right slice of it.
+
+**Three plausible fixes**, all real engineering:
+
+- **Patch ZLUDA** to load *all* PTX modules in a fatbin (concatenate, or
+  iteratively compile and merge into a single HIP module). The
+  `// TODO: actually sort by SM` comment hints this code is known to be
+  underpowered.
+- **Refactor RZ kernels** to be self-contained per `.cu` file (no
+  cross-CU `__device__` calls), so each fatbin naturally has one PTX.
+  Large refactor.
+- **NVCC ships an option** to emit one fatbin per CU at link time
+  (preserving rdc semantics but producing per-CU artefacts). Unlikely
+  but free if Nvidia did it.
+
+**SP1 under ZLUDA: not tested.** SP1 GPU prover needs a separate
+`sp1-cuda` server process and exercises broader PTX surface. Likely
+hits the same ZLUDA selection limitation (worse, since SP1's
+`sp1-recursion-gnark-ffi` and the Hypercube prover pull in additional
+PTX modules).
+
+**Status.** ZLUDA + RZ doesn't work end-to-end on the AMD GPU today, but
+the failure is now precisely scoped — it's not a black-box "named symbol
+not found", it's "single-PTX-per-fatbin selection in `get_best_ptx_and_compile`,
+incompatible with rdc-linked multi-CU fatbins." A focused upstream PR to
+ZLUDA's module loader would unblock both provers and probably any other
+project that ships rdc CUDA kernels.
 
 ### Recommendation
 
 Treat the RX 7900 XT as latent capacity for the medium term. Watch
-[PR #3725][r3725] (RZ → CubeCL) AND ZLUDA's `cudaLaunchKernelEx` work; either
+[PR #3725][r3725] (RZ → CubeCL) AND ZLUDA's
+`get_best_ptx_and_compile` (it's flagged as TODO upstream); either
 landing would unlock the GPU. For now, capacity planning should assume CPU
 proving on this machine, with the published CUDA speedup ratios in
 `PROPOSAL.md` (§ "CPU vs GPU Proving Throughput") as an upper bound — not
 what this Radeon will deliver as is.
+
+**Reproduction (full).** Build env:
+
+```
+CUDA_PATH=/nix/store/...-cuda-merged-12.9          # nixpkgs#cudaPackages.cudatoolkit
+CUDA_LIBRARY_PATH=/tmp/cuda-shim                   # symlink shim with lib64/
+PROTOC=.../bin/protoc                              # nixpkgs#protobuf
+LIBCLANG_PATH=.../lib                              # nixpkgs#llvmPackages.libclang.lib
+BINDGEN_EXTRA_CLANG_ARGS=-isystem .../glibc-dev/include -isystem $CUDA_PATH/include
+PATH=/tmp/cuda-shim/bin:$CUDA_PATH/bin:...         # wrapper before real nvcc
+```
+
+The cuda-shim is `mkdir -p /tmp/cuda-shim/{lib64,include,bin}` then
+symlinking everything from `$CUDA_PATH/lib/*` and `$CUDA_PATH/lib/stubs/*`
+into `lib64/`, all of `$CUDA_PATH/include/*` into `include/`, and an
+`nvcc` wrapper that strips `-arch=*`, appends two `-gencode` entries
+(`compute_86,sm_86` + `compute_86,compute_86`) plus `-DNDEBUG`, and on
+`--device-link` ALSO injects `--relocatable-ptx`. Enable RZ's `cuda`
+feature in `host/Cargo.toml`, `cargo build --release`, then run
+`RISC0_PROVER=local zluda-run ./target/release/host --sha256 1k`. Binary
+will get to first kernel launch and panic identically to the symptom
+above (because of the ZLUDA single-pick issue, not because of
+toolchain misconfiguration).
 
 [zluda]: https://github.com/vosen/ZLUDA
 [r3725]: https://github.com/risc0/risc0/pull/3725
