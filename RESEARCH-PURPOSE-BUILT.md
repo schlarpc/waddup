@@ -248,3 +248,9 @@ check) well inside Aeneas's subset.
   midstate chain removes the prover entirely for every hash waddup targets
   except SHA-3, and is the only option that can be fully verified end to end
   on a short timeline.
+
+**Decision (2026-09-28):** the goal is correct downloads without wasted time,
+not a transferable certificate, so the midstate chain is adopted and the ZK
+layer is dropped. See `DESIGN-MIDSTATE.md` for the protocol flow, waste
+bounds, DAT-hash (SHA-1) keying, sidecar sizes and the implementation
+verification plan.

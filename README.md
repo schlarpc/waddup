@@ -13,7 +13,10 @@ All modes validate journal hashes against natively-computed values and report
 per-phase cycle counts.
 
 See [`RESEARCH.md`](RESEARCH.md) for the head-to-head comparison and the AMD-GPU
-acceleration story.
+acceleration story, [`RESEARCH-PURPOSE-BUILT.md`](RESEARCH-PURPOSE-BUILT.md) for
+purpose-built provers (Flock, Plonky3, Binius64, Stwo, GKR) and Lean
+verification, and [`DESIGN-MIDSTATE.md`](DESIGN-MIDSTATE.md) for the adopted
+non-ZK midstate-chain design that replaces the proof layer.
 
 ## Prerequisites
 
